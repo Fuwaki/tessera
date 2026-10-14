@@ -25,6 +25,23 @@ model → typed graph → MLIR → hardware plan → RTL
 
 Generation and simulation are not optional post-processing. They are first-class compiler stages and must be available from the initial supported operator set.
 
+### 1.1 Persistent stage artifacts
+
+The compiler MUST treat intermediate artifacts as part of the product, not temporary debug output. Import, optimization, lowering, constraint solving, layout materialization, RTL emission, and verification MUST have inspectable boundaries.
+
+Each persisted artifact MUST include:
+
+- a format name and schema version;
+- input artifact hashes;
+- compiler/pass/target revisions;
+- relevant options and search seed;
+- deterministic content or a documented normalization rule;
+- diagnostics and metrics produced at that stage.
+
+Stage commands MUST validate artifact compatibility before consuming it. A user MUST be able to rerun layout search with a different hardware constraint or policy file without repeating graph import and MLIR optimization. RTL emission MUST consume a validated layout and MUST NOT silently change the selected layout.
+
+The repository SHOULD provide inspection commands for graph metrics, MLIR/lowered IR, constraints, rejected candidates, layout resources, schedule steps, and verification results. A successful stage is a reusable result even when a later stage fails.
+
 ## 2. Rust modeling rules
 
 ### 2.1 Prefer types over conventions

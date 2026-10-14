@@ -8,21 +8,19 @@ Tessera compiles a quantized model graph into a resource-constrained hardware ex
 
 ## Design thesis
 
+Tessera is an explicit, persistent compilation pipeline rather than a one-shot model-to-RTL command:
+
 ```text
-ONNX / manifest
-      ↓
-Graph IR
-      ↓
-MLIR optimization and progressive lowering
-      ↓
-Hardware-aware planning
-      ↓
-Execution Plan
-      ↓
-RTL + weights + runtime artifacts
+model description
+  → graph.tgraph
+  → optimized.tgraph / lowered.tir
+  → target.toml + policy.toml
+  → layout.tlayout
+  → RTL + weights + reports
+  → simulation / synthesis / board measurements
 ```
 
-MLIR owns graph, tensor, buffer, and loop transformations. Tessera-owned hardware IR and backends own FPGA resources, cycle models, memory placement, scheduling, and RTL emission.
+Every stage produces an inspectable, versioned artifact. Users can inspect graph metrics, change hardware constraints, compare multiple layouts, and emit RTL only after selecting a validated layout. MLIR owns graph/tensor/buffer/loop transformations; Tessera-owned planning and backends own target resources, schedules, memory placement, and RTL emission.
 
 ## Initial target
 
@@ -33,8 +31,9 @@ The first target is Efinix Titanium Ti60, using the existing `nngen` / `fpga_st_
 - Workspace and CLI skeleton created.
 - Concept book: [`docs/concept-book.md`](docs/concept-book.md).
 - Initial architecture decision: [`docs/adr/0001-rust-mlir-boundary.md`](docs/adr/0001-rust-mlir-boundary.md).
+- Hardware constraint language: [`docs/constraint-language.md`](docs/constraint-language.md).
 - Quality standard: [`QUALITY.md`](QUALITY.md).
-- Version-control standard: [`VERSIONING.md`](VERSIONING.md).
+- Multi-stage artifact decision: [`docs/adr/0002-persisted-compiler-stages.md`](docs/adr/0002-persisted-compiler-stages.md).
 - No model import, MLIR lowering, planner, or RTL backend is implemented yet.
 
 ## First milestone

@@ -42,31 +42,115 @@ Tessera treats both as hardware backends of one compiler, not as one code genera
 - Inferring exact post-place-and-route timing from static IR alone.
 - CPU-driven dispatch for every layer.
 
-## 3. Compiler contract
+## 3. Compiler as a persistent pipeline
+
+Tessera is not a single command that transforms a model directly into RTL. It is a sequence of inspectable, resumable stages. Every stage consumes a versioned artifact and produces a versioned artifact that can be viewed, validated, compared, and reused by later stages.
 
 ```text
-Model frontend
-  → Graph IR
-  → MLIR graph/tensor/buffer/loop optimization
-  → Hardware IR
-  → Target-aware design-space search
-  → Execution Plan
-  → RTL backend
-  → simulation / synthesis / board validation
+model description
+    ↓ import
+graph artifact
+    ↓ MLIR optimize / progressively lower
+optimized graph artifact
+    ↓ target constraints + layout search
+layout artifact
+    ↓ plan validation / schedule materialization
+execution-plan artifact
+    ↓ RTL lowering
+RTL artifact bundle
+    ↓ simulation / synthesis / board validation
+measurement artifacts
 ```
+
+The compiler MUST allow a user to stop after any successful stage. A later command MUST be able to consume a saved artifact without rerunning earlier stages when the artifact's provenance and schema are compatible.
+
+The stages are:
+
+1. **Import** — parse ONNX or manifest into target-independent Graph IR.
+2. **Graph optimization** — canonicalize, fuse, eliminate copies, and preserve numerical semantics through MLIR.
+3. **Progressive lowering** — expose tensors, buffers, loops, and primitive operations while retaining Tessera hardware-relevant attributes.
+4. **Constraint loading** — parse a user-editable target and policy description.
+5. **Layout search** — explore execution mode, folding, fusion, tile/row granularity, memory placement, and engine assignment.
+6. **Layout materialization** — save the selected layout and resource/cycle/bandwidth report.
+7. **RTL lowering** — convert only a validated layout into RTL, memories, schedule tables, and driver metadata.
+8. **Verification and measurement** — run semantic simulation, RTL simulation, synthesis, and optional board validation.
+
+The term **layout** means the hardware organization and placement of computation/data, not FPGA physical placement and routing. Physical placement remains a downstream Efinity/toolchain result.
+
+### 3.1 Stage commands
+
+The CLI SHOULD expose explicit stage commands rather than hiding the pipeline behind one opaque invocation:
+
+```text
+tessera import model.json --out graph.tgraph
+tessera optimize graph.tgraph --out optimized.tgraph
+tessera lower optimized.tgraph --out lowered.tir
+tessera solve lowered.tir --target ti60.toml --policy policy.toml --out layout.tlayout
+tessera inspect graph.tgraph
+tessera inspect optimized.tgraph --metrics
+tessera inspect layout.tlayout --resources --schedule
+tessera emit layout.tlayout --out build/
+tessera verify layout.tlayout --rtl build/
+```
+
+Each command MUST validate its input artifact before work begins and MUST write provenance into its output. A failed later stage MUST NOT invalidate earlier artifacts.
+
+### 3.2 Metrics are first-class artifacts
+
+Graph and layout inspection MUST be available without generating RTL. Metrics MAY include:
+
+- operator and tensor counts;
+- shape and dtype summaries;
+- fan-out and critical-path information;
+- estimated MACs and activation bytes;
+- fusion candidates and rejected legality reasons;
+- buffer lifetimes and peak live bytes;
+- candidate DSP/RAM/logic use;
+- estimated cycles and DDR traffic;
+- constraint slack and bottlenecks.
+
+Reports MUST identify whether a value is static analysis, target-model estimate, synthesis measurement, or board measurement.
+
+### 3.3 Iterative compilation
+
+The user MUST be able to modify only the target constraints or planning policy and rerun layout search against the same optimized graph. Conversely, graph optimization MUST be reusable across multiple target descriptions. Layout search MUST be reusable across multiple RTL emission attempts when the layout schema and backend contract remain compatible.
+
+The cache key for a stage is the content hash of:
+
+```text
+input artifact + relevant options + target/policy + compiler/pass versions
+```
+
+No stage may rely on an implicit current working directory or mutable global state.
+
+## 4. Compiler contracts
 
 The boundaries are deliberate:
 
-- **Graph IR** owns model semantics.
-- **MLIR** owns legal graph and loop transformations.
-- **Hardware IR** owns tiles, engines, buffers, streams, DMA, and schedules.
-- **Target model** owns resource and cost rules.
-- **Execution Plan** is the reproducible compiler output before code generation.
-- **RTL backend** owns module binding and cycle-level implementation.
+- **Graph artifact** owns model semantics and is target-independent.
+- **Optimized graph artifact** records MLIR transformations and their legality/provenance.
+- **Lowered IR artifact** exposes buffers, loops, and primitive operations without selecting a complete FPGA layout.
+- **Constraint description** owns user-visible hardware budgets and search policy.
+- **Layout artifact** owns the selected hardware organization, placement, schedule, and estimates.
+- **Execution Plan** is the backend-ready portion of a layout and is reproducible before code generation.
+- **RTL artifact bundle** owns module binding, cycle-level implementation, memory images, and interfaces.
+- **Measurement artifacts** own simulator, synthesis, and board observations; they never silently overwrite estimates.
 
-## 4. IR layers
+```text
+Graph IR
+  → Optimized Graph IR
+  → Lowered Primitive IR
+  → Layout IR
+  → Execution Plan
+  → RTL IR / SystemVerilog
+```
 
-### 4.1 Graph IR
+The persistent file format for each boundary is part of the public compiler contract. It MUST be versioned independently from in-memory Rust types.
+
+
+## 5. IR layers
+
+### 5.1 Graph IR
 
 The graph IR represents operators and tensors without committing to an execution architecture:
 
@@ -86,7 +170,7 @@ Initial operators:
 - elementwise `add`;
 - nearest-neighbor upsample.
 
-### 4.2 MLIR layer
+### 5.2 MLIR layer
 
 Tessera will lower Graph IR to a domain-aware MLIR representation. MLIR passes may progressively expose:
 
@@ -106,7 +190,7 @@ Early optimization candidates:
 
 Generic `linalg`, `tensor`, `memref`, `affine`, and `scf` are reusable implementation layers. Hardware-specific semantics must remain explicit in a Tessera dialect or hardware IR rather than being reconstructed from arbitrary low-level loops.
 
-### 4.3 Hardware IR
+### 5.3 Hardware IR
 
 Hardware IR describes a realization:
 
@@ -119,7 +203,7 @@ Hardware IR describes a realization:
 - schedule steps and dependencies;
 - resource reservations.
 
-### 4.4 Execution Plan
+### 5.4 Execution Plan
 
 The execution plan is a versioned, serializable artifact. It must include enough information to reproduce RTL and reports:
 
@@ -133,7 +217,7 @@ The execution plan is a versioned, serializable artifact. It must include enough
 - estimated cycles, DSP, RAM, logic, and DDR traffic;
 - compiler and model hashes.
 
-## 5. Target model
+## 6. Target model
 
 A target model is a plugin, not a global constant table. It exposes:
 
@@ -159,7 +243,7 @@ The Ti60 model must represent at least:
 
 Static estimates are not treated as proof. Synthesis and place-and-route reports are measurements used to calibrate the target model.
 
-## 6. Planner
+## 7. Planner
 
 The planner solves a constrained design-space problem. A candidate may vary:
 
@@ -195,7 +279,7 @@ Objectives are configurable. Examples:
 
 The first solver should use candidate enumeration, pruning, and branch-and-bound. A CP-SAT solver may be introduced after the cost model and plan schema stabilize.
 
-## 7. RTL backends
+## 8. RTL backends
 
 Backends consume the same Execution Plan but may emit different structures:
 
@@ -213,7 +297,7 @@ Generates a configurable MAC engine, tile buffers, line buffers, DMA, ping-pong 
 
 The backends share semantics and plan validation, not necessarily RTL implementation details.
 
-## 8. Verification
+## 9. Verification
 
 Every compiler stage needs an executable oracle:
 
@@ -235,7 +319,7 @@ Initial acceptance criteria:
 5. Efinity synthesis reports are parsed and compared with estimates.
 6. A board run confirms output and schedule counters for one fixed model.
 
-## 9. Project structure
+## 10. Project structure
 
 Planned modules:
 
@@ -255,7 +339,7 @@ crates/tessera/
 
 The current repository begins as one crate to keep iteration cheap; modules may become workspace crates once interfaces stabilize.
 
-## 10. Initial milestones
+## 11. Initial milestones
 
 ### M0: repository and contracts
 
@@ -298,7 +382,7 @@ The current repository begins as one crate to keep iteration cheap; modules may 
 - Cost-model calibration.
 - Board integration without per-layer CPU scheduling.
 
-## 11. Non-goals and risks
+## 12. Non-goals and risks
 
 ### Risks
 
@@ -318,7 +402,7 @@ The current repository begins as one crate to keep iteration cheap; modules may 
 - Preserve old NNgen/st_stream paths as temporary oracles.
 - Add target and backend interfaces before adding more operators.
 
-## 12. Naming and positioning
+## 13. Naming and positioning
 
 Tessera is intentionally neutral: it describes composition of tiles and does not lock the project to Efinix, one dataflow style, or one IR. The public description should be:
 
