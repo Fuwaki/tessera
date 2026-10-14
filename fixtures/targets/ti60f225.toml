@@ -1,0 +1,45 @@
+format = "tessera.target"
+name = "ti60f225"
+revision = "fpga_src-2026-10-10"
+schema_version = 1
+
+[budget]
+ddr_read_bytes_per_s = 900000000
+ddr_write_bytes_per_s = 700000000
+dsp48 = 160
+ram10 = 256
+xlr = 60800
+
+[clock]
+core_hz = 100000000
+
+[logic]
+xlr_per_engine = 2500
+xlr_per_mac_lane = 0
+xlr_per_ram_block = 0
+
+[mac]
+int8xint8_per_dsp48 = 2
+int9xint8_per_dsp48 = 1
+requant_lane_dsp48 = 1
+
+[ram]
+
+[[ram.primitive]]
+capacity_bits = 10240
+max_depth = 1024
+max_width_bits = 40
+name = "ram10"
+read_ports = 1
+write_ports = 1
+
+[reserved]
+dsp48 = 8
+ram10 = 168
+xlr = 20232
+
+[stream]
+
+[[stream.primitive]]
+name = "efx_dsp48"
+valid_modes = ["int8_mac_dual", "int9_mac_single"]

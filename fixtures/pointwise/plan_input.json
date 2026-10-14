@@ -1,0 +1,86 @@
+{
+  "name": "fixture-pointwise",
+  "tensors": [
+    {
+      "id": 0,
+      "name": "x",
+      "shape": {
+        "n": 1,
+        "c": 4,
+        "h": 8,
+        "w": 8
+      },
+      "elem": "i8"
+    },
+    {
+      "id": 1,
+      "name": "pw.w",
+      "shape": {
+        "n": 4,
+        "c": 4,
+        "h": 1,
+        "w": 1
+      },
+      "elem": "i8"
+    },
+    {
+      "id": 2,
+      "name": "y",
+      "shape": {
+        "n": 1,
+        "c": 4,
+        "h": 8,
+        "w": 8
+      },
+      "elem": "i8"
+    }
+  ],
+  "ops": [
+    {
+      "name": "pw",
+      "kind": "pointwise_conv2d",
+      "inputs": [
+        0
+      ],
+      "outputs": [
+        2
+      ],
+      "detail": {
+        "conv": {
+          "weights": 1,
+          "groups": 1,
+          "stride": [
+            1,
+            1
+          ],
+          "padding": {
+            "zero": {
+              "top": 0,
+              "bottom": 0,
+              "left": 0,
+              "right": 0
+            }
+          },
+          "requant": {
+            "m0": 65536,
+            "shift": 18,
+            "rounding": "half_up",
+            "saturate_lo": -128,
+            "saturate_hi": 127
+          },
+          "activation": {
+            "kind": "relu",
+            "clamp_lo": 0,
+            "clamp_hi": 127
+          }
+        }
+      }
+    }
+  ],
+  "inputs": [
+    0
+  ],
+  "outputs": [
+    2
+  ]
+}

@@ -79,21 +79,21 @@ The term **layout** means the hardware organization and placement of computation
 
 ### 3.1 Stage commands
 
-The CLI SHOULD expose explicit stage commands rather than hiding the pipeline behind one opaque invocation:
+The CLI exposes explicit stage commands rather than hiding the pipeline behind one opaque invocation ([`cli.md`](cli.md) is the command reference; `--help` is authoritative):
 
 ```text
-tessera import model.json --out graph.tgraph
-tessera optimize graph.tgraph --out optimized.tgraph
-tessera lower optimized.tgraph --out lowered.tir
-tessera solve lowered.tir --target ti60.toml --policy policy.toml --out layout.tlayout
-tessera inspect graph.tgraph
-tessera inspect optimized.tgraph --metrics
-tessera inspect layout.tlayout --resources --schedule
-tessera emit layout.tlayout --out build/
-tessera verify layout.tlayout --rtl build/
+tessera import    manifest.json|dir --input-shape N,H,W,C --out build/
+tessera emit-mlir build/graph.tgraph --out build/
+tessera optimize  build/mlir.json --out build/          # requires the `melior` feature
+tessera solve     --graph build/graph.tgraph --target ti60.toml --policy p.toml --out build/
+tessera solve     --primitive primitive.json --target ti60.toml --policy p.toml --out build/
+tessera inspect   build/graph.tgraph | build/mlir.json | build/layout.tlayout | build/rtl/rtl_bundle.json
+tessera emit      build/layout.tlayout --graph build/graph.tgraph --out build/
+tessera simulate  build/layout.tlayout --weights DIR --out build/
+tessera verify    build/
 ```
 
-Each command MUST validate its input artifact before work begins and MUST write provenance into its output. A failed later stage MUST NOT invalidate earlier artifacts.
+Each command validates its input artifact before work begins and writes provenance into its output. A stage directory keeps every artifact, plus copies of the target and policy a layout was solved against, so `verify` can re-check the whole chain later without the original paths. A failed later stage does not invalidate earlier artifacts.
 
 ### 3.2 Metrics are first-class artifacts
 
@@ -295,6 +295,12 @@ Generates ready/valid layers from the existing `st_stream` primitive library: wi
 
 Generates a configurable MAC engine, tile buffers, line buffers, DMA, ping-pong control, and a static schedule engine. This is the primary new backend.
 
+### Implemented in v1
+
+The emitted backend (`tessera.pw_dot.i8i8.v1`) is a narrow, streaming pointwise-dot kernel with a ready/valid interface, a folded weight ROM and a per-channel requantization ROM. It emits **exactly one kernel**: a single pointwise step with signed int8 activations, no bias, and streamed activation buffers. Everything outside that envelope is rejected by step name, with the unsupported construct named — a multi-step plan, a depthwise or non-1x1 kernel, `add`, standalone requant/activation, upsampling, unsigned output, bias terms, shared-tile/hybrid engines, non-stream activation buffers, or requantization outside the 17-bit multiplier field. A layout that the backend cannot emit is a planning result to be revisited, never a silently altered plan (ADR-0003).
+
+For this reason a whole-model layout (for example the W8 example's seven steps) solves successfully and is then rejected at `emit` with the full step list. The narrow envelope is reachable end to end from a pointwise plan, which `fixtures/pointwise` demonstrates, and simulation is verified against the Rust reference model when Verilator is available.
+
 The backends share semantics and plan validation, not necessarily RTL implementation details.
 
 ## 9. Verification
@@ -381,6 +387,10 @@ The current repository begins as one crate to keep iteration cheap; modules may 
 - Efinity synthesis report parser.
 - Cost-model calibration.
 - Board integration without per-layer CPU scheduling.
+
+### Status at v0.1
+
+M1-M3 are implemented: the graph IR and manifest frontend, deterministic MLIR emission (with in-process optimization behind the optional `melior` feature), the Ti60 target model and layout search, and the persisted stage artifacts with cross-stage provenance verification. M4 is implemented for a deliberately narrow envelope — one streaming pointwise-dot kernel with a Verilator bit-exact test — and rejects the rest of the plan space by name, so M5 (whole-model RTL, synthesis reports, board measurement) remains open. DMA scheduling and the shared-tile backend are not implemented.
 
 ## 12. Non-goals and risks
 

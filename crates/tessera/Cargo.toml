@@ -10,10 +10,15 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Optional in-process MLIR. Pinned exactly: both the pass names and the Melior
+# API used by `src/mlir/pipeline.rs` are release specific. Requires an
+# LLVM/MLIR 23.x installation discoverable through `MLIR_SYS_230_PREFIX`
+# (see docs/developer-setup.md); the default build never touches it.
+melior = { version = "=0.28.2", optional = true }
 
 [features]
 default = []
-melior = []
+melior = ["dep:melior"]
 
 [[bin]]
 name = "tessera"

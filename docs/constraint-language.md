@@ -221,23 +221,24 @@ output_buffer = "pong"
 Users can iterate without repeating earlier work:
 
 ```sh
-# Import and optimize once.
-tessera import model.json --out graph.tgraph
-tessera optimize graph.tgraph --out optimized.tgraph
+# Import and lower once.
+tessera import model.json --input-shape 1,480,640,3 --out build/
+tessera emit-mlir build/graph.tgraph --out build/
 
 # Explore several hardware assumptions and policies.
-tessera solve optimized.tgraph --target ti60.toml --policy fast.toml --out fast.tlayout
-tessera solve optimized.tgraph --target ti60.toml --policy small.toml --out small.tlayout
+tessera solve --graph build/graph.tgraph --target ti60.toml --policy fast.toml  --out build/fast
+tessera solve --graph build/graph.tgraph --target ti60.toml --policy small.toml --out build/small
 
-tessera inspect fast.tlayout --resources --schedule
-
-tessera inspect small.tlayout --resources --schedule
+tessera inspect build/fast/layout.tlayout
+tessera inspect build/small/layout.tlayout
 
 # Emit only a selected validated layout.
-tessera emit fast.tlayout --backend shared-tile --out build/fast
+tessera emit build/fast/layout.tlayout --graph build/graph.tgraph --out build/fast
 ```
 
 A layout can be regenerated with a different backend only when that backend declares support for the layout features. Otherwise the compiler must report the missing capability.
+
+**Current backend capability.** The v1 SystemVerilog backend emits exactly one pointwise step (signed int8 activations, ROM weights, streamed activation buffers, no bias), so a whole-model layout is rejected at `emit` with the offending steps named. An unsupported layout is a planning result: change the target or policy, or supply a graph inside the supported envelope (see `fixtures/pointwise`), and solve again. `emit` never re-solves and never alters the selected layout. See [cli.md](cli.md) for the full command reference.
 
 ## 7. Design rules
 

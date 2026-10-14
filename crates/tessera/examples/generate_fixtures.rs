@@ -1,0 +1,285 @@
+//! Deterministic generator for the checked-in examples under `fixtures/`.
+//!
+//! The target and policy files are rendered from the same Rust types the
+//! compiler loads, so an example can never drift from the schema; the synthetic
+//! manifest, weight blobs and primitive graph are generated from fixed seeds.
+//!
+//! ```sh
+//! cargo run -p tessera --example generate_fixtures
+//! ```
+//!
+//! Everything it writes is byte-for-byte reproducible.
+
+use std::path::PathBuf;
+
+use tessera::layout::{
+    Activation, ActivationKind, ElemType, ExecutionMode, FusionBoundary, FusionKind, Granularity,
+    ObjectiveSpec, ObjectiveTerm, OpKind, Requant, Rounding, TensorId, TensorShape,
+};
+use tessera::planner::{
+    ConvDetail, Hints, MemoryPolicy, OpDetail, PlanInput, Policy, PolicyConstraints, PrimitiveOp,
+    SearchPolicy, TensorDesc,
+};
+use tessera::planner::{FusionPolicy, Padding as PlanPadding};
+use tessera::planner::{POLICY_FORMAT, POLICY_SCHEMA_VERSION};
+use tessera::target::Ti60Target;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()?;
+    let fixtures = root.join("fixtures");
+
+    write(
+        &fixtures.join("targets/ti60f225.toml"),
+        &Ti60Target::ti60f225_reference().to_toml_string()?,
+    )?;
+    write(
+        &fixtures.join("policies/streaming.toml"),
+        &streaming_policy().to_toml_string()?,
+    )?;
+    write(
+        &fixtures.join("policies/explore.toml"),
+        &explore_policy().to_toml_string()?,
+    )?;
+
+    write(&fixtures.join("w8/manifest.json"), W8_MANIFEST)?;
+    write(&fixtures.join("w8/weights.bin"), &pattern(172, 7, 3))?;
+
+    write(
+        &fixtures.join("pointwise/plan_input.json"),
+        &(serde_json::to_string_pretty(&pointwise_input())? + "\n"),
+    )?;
+    write(
+        &fixtures.join("pointwise/weights/pw.w.bin"),
+        &pointwise_weights(),
+    )?;
+
+    println!("fixtures written under {}", fixtures.display());
+    Ok(())
+}
+
+/// Write one fixture file, creating parents, and report its size.
+fn write(path: &PathBuf, contents: impl AsRef<[u8]>) -> Result<(), Box<dyn std::error::Error>> {
+    let contents = contents.as_ref();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents)?;
+    println!("  {} ({} bytes)", path.display(), contents.len());
+    Ok(())
+}
+
+/// Deterministic byte pattern with no zero runs, so a mis-sliced blob shows up.
+fn pattern(len: usize, mul: usize, add: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| ((i * mul + add) % 251 + 1) as u8)
+        .collect()
+}
+
+fn streaming_policy() -> Policy {
+    Policy {
+        format: POLICY_FORMAT.into(),
+        schema_version: POLICY_SCHEMA_VERSION,
+        objective: ObjectiveSpec {
+            primary: ObjectiveTerm::MinimizeCycles,
+            secondary: vec![ObjectiveTerm::MinimizeDdrBytes],
+        },
+        constraints: PolicyConstraints {
+            max_frame_cycles: 50_000_000,
+            require_bit_exact: true,
+            allow_cpu_layer_dispatch: false,
+        },
+        search: SearchPolicy {
+            // The RTL backend of this build emits dedicated and streaming
+            // organizations only, so this policy stays inside that envelope.
+            execution_modes: vec![ExecutionMode::Streaming, ExecutionMode::Dedicated],
+            granularities: vec![Granularity::Frame],
+            tile_widths: vec![],
+            tile_heights: vec![],
+            max_candidates: 200_000,
+            seed: 1,
+            utilisation_percent: 85,
+        },
+        fusion: FusionPolicy {
+            allow: vec![
+                FusionKind::DepthwiseRequantPointwise,
+                FusionKind::ShortResidual,
+            ],
+            forbid: vec![FusionBoundary::FanoutValue],
+        },
+        memory: MemoryPolicy::default(),
+        operator_override: vec![],
+        hint: Hints::default(),
+    }
+}
+
+fn explore_policy() -> Policy {
+    let mut policy = streaming_policy();
+    policy.search.execution_modes = vec![
+        ExecutionMode::SharedTile,
+        ExecutionMode::Streaming,
+        ExecutionMode::Hybrid,
+        ExecutionMode::Dedicated,
+    ];
+    policy.search.granularities = vec![Granularity::Row, Granularity::Tile, Granularity::Frame];
+    policy.search.tile_widths = vec![16, 32, 64];
+    policy.search.tile_heights = vec![16, 32, 48];
+    policy
+}
+
+/// Synthetic `fpga_st_train.int8.v1` manifest: `stem` 3x3, `dw` depthwise 3x3,
+/// `mid` 1x1, a residual add, nearest upsample and an unsigned head - the same
+/// operator coverage as the reference W8 model, with no external data.
+const W8_MANIFEST: &str = r#"{
+  "format": "fpga_st_train.int8.v1",
+  "arch": "fixture-w8",
+  "bits": { "acts": 8, "weights": 8 },
+  "act_qmax": 127.0,
+  "output_qmax": 255.0,
+  "weight_qmax": 127.0,
+  "notes": ["synthetic fixture generated by crates/tessera/examples/generate_fixtures.rs"],
+  "points": ["image", "stem.in", "dw.in", "mid.in"],
+  "point_scales": [0.007874016, 0.014, 0.02, 0.03],
+  "weight_file": "weights.bin",
+  "weight_packing": "i8-x1",
+  "weight_bytes": 172,
+  "graph": [
+    { "op": "conv", "layer": "stem", "point": 0, "scale": 0.007874016 },
+    { "op": "relu", "layer": "stem" },
+    { "op": "conv", "layer": "dw", "point": 1, "scale": 0.014 },
+    { "op": "relu", "layer": "dw" },
+    { "op": "conv", "layer": "mid", "point": 2, "scale": 0.02 },
+    { "op": "relu", "layer": "mid" },
+    { "op": "add", "point": 3, "source_point": 1, "scale": 0.03 },
+    { "op": "upsample_nearest2x", "point": 3 },
+    { "op": "conv", "layer": "head", "point": 3, "scale": 0.03 },
+    { "op": "quantize_u8_output", "scale": 0.003921569 }
+  ],
+  "layers": [
+    {
+      "name": "stem", "op": "conv2d+relu",
+      "in_channels": 3, "out_channels": 4,
+      "act_bits": 8, "weight_bits": 8, "act_zero_point": 0,
+      "out_relu": true, "out_unsigned": false,
+      "kernel": [3, 3], "stride": [1, 1], "reflect_pad": 1,
+      "in_point": 0, "out_point": 1,
+      "in_scale": 0.007874016, "out_scale": 0.014,
+      "weight_scale": [0.01, 0.02, 0.03, 0.04],
+      "bias": [0.1, -0.1, 0.2, -0.2],
+      "bias_int32": [10, -10, 20, -20],
+      "requant": [0.0056, 0.011, 0.017, 0.022],
+      "weight_offset": 0, "weight_count": 108,
+      "weight_byte_offset": 0, "weight_bytes": 108
+    },
+    {
+      "name": "dw", "op": "depthwise_conv2d+relu",
+      "in_channels": 4, "out_channels": 4, "groups": 4,
+      "act_bits": 8, "weight_bits": 8, "act_zero_point": 0,
+      "out_relu": true, "out_unsigned": false,
+      "kernel": [3, 3], "stride": [1, 1], "reflect_pad": 1,
+      "in_point": 1, "out_point": 2,
+      "in_scale": 0.014, "out_scale": 0.02,
+      "weight_scale": [0.01, 0.02, 0.03, 0.04],
+      "bias": [0.0, 0.0, 0.0, 0.0],
+      "bias_int32": [0, 0, 0, 0],
+      "requant": [0.01, 0.01, 0.01, 0.01],
+      "weight_offset": 108, "weight_count": 36
+    },
+    {
+      "name": "mid", "op": "conv2d+relu",
+      "in_channels": 4, "out_channels": 4,
+      "out_relu": true, "out_unsigned": false,
+      "kernel": [1, 1], "stride": [1, 1], "reflect_pad": 0,
+      "in_point": 2, "out_point": 3,
+      "in_scale": 0.02, "out_scale": 0.03,
+      "weight_scale": [0.02, 0.02, 0.02, 0.02],
+      "bias": [0.0, 0.0, 0.0, 0.0],
+      "bias_int32": [0, 0, 0, 0],
+      "requant": [0.01, 0.01, 0.01, 0.01],
+      "weight_offset": 144, "weight_count": 16
+    },
+    {
+      "name": "head", "op": "conv2d",
+      "in_channels": 4, "out_channels": 3,
+      "out_relu": false, "out_unsigned": true,
+      "kernel": [1, 1], "stride": [1, 1], "reflect_pad": 0,
+      "in_point": 3, "out_point": 4,
+      "in_scale": 0.03, "out_scale": 0.003921569,
+      "weight_scale": [0.02, 0.02, 0.02],
+      "bias": [0.0, 0.0, 0.0],
+      "bias_int32": [0, 0, 0],
+      "requant": [0.1, 0.1, 0.1],
+      "weight_offset": 160, "weight_count": 12
+    }
+  ]
+}
+"#;
+
+/// A single pointwise step that fits the RTL backend's supported envelope:
+/// signed int8 in and out, one 1x1 kernel, no bias, one requantization contract.
+fn pointwise_input() -> PlanInput {
+    PlanInput {
+        name: "fixture-pointwise".to_string(),
+        tensors: vec![
+            TensorDesc {
+                id: TensorId(0),
+                name: "x".to_string(),
+                shape: TensorShape::new(1, 4, 8, 8),
+                elem: ElemType::I8,
+            },
+            TensorDesc {
+                id: TensorId(1),
+                name: "pw.w".to_string(),
+                shape: TensorShape::new(4, 4, 1, 1),
+                elem: ElemType::I8,
+            },
+            TensorDesc {
+                id: TensorId(2),
+                name: "y".to_string(),
+                shape: TensorShape::new(1, 4, 8, 8),
+                elem: ElemType::I8,
+            },
+        ],
+        ops: vec![PrimitiveOp {
+            name: "pw".to_string(),
+            kind: OpKind::PointwiseConv2d,
+            inputs: vec![TensorId(0)],
+            outputs: vec![TensorId(2)],
+            detail: OpDetail::Conv(ConvDetail {
+                weights: TensorId(1),
+                bias: None,
+                groups: 1,
+                stride: [1, 1],
+                padding: PlanPadding::Zero {
+                    top: 0,
+                    bottom: 0,
+                    left: 0,
+                    right: 0,
+                },
+                // 2^16 * 2^-18 = 0.25 exactly: a requantization the emitted
+                // fixed-point datapath reproduces bit-exactly.
+                requant: Requant::uniform(65_536, 18, Rounding::HalfUp, -128, 127),
+                activation: Activation {
+                    kind: ActivationKind::Relu,
+                    clamp_lo: 0,
+                    clamp_hi: 127,
+                },
+            }),
+        }],
+        inputs: vec![TensorId(0)],
+        outputs: vec![TensorId(2)],
+    }
+}
+
+/// `(out_channel, in_channel)` weight matrix, in a deterministic pattern.
+fn pointwise_weights() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(16);
+    for out in 0..4i32 {
+        for input in 0..4i32 {
+            bytes.push(((out * 5 + input * 3) % 17 - 8) as i8 as u8);
+        }
+    }
+    bytes
+}
