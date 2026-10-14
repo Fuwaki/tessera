@@ -1,0 +1,20 @@
+[package]
+name = "tessera"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "An extensible hardware-aware compiler for quantized neural networks on FPGAs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+default = []
+melior = []
+
+[[bin]]
+name = "tessera"
+path = "src/main.rs"

@@ -1,0 +1,12 @@
+/target/
+**/target/
+*.swp
+.DS_Store
+.env
+
+# Generated compiler outputs
+/build/
+/out/
+/artifacts/
+*.vcd
+*.fst
