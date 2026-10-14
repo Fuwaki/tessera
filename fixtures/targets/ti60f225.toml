@@ -19,6 +19,7 @@ xlr_per_mac_lane = 0
 xlr_per_ram_block = 0
 
 [mac]
+dsp_multiplier_operand_bits = 18
 int8xint8_per_dsp48 = 2
 int9xint8_per_dsp48 = 1
 requant_lane_dsp48 = 1
@@ -27,11 +28,43 @@ requant_lane_dsp48 = 1
 
 [[ram.primitive]]
 capacity_bits = 10240
-max_depth = 1024
-max_width_bits = 40
+max_depth = 8192
+max_width_bits = 20
 name = "ram10"
 read_ports = 1
 write_ports = 1
+
+[[ram.primitive.mode]]
+depth = 8192
+width_bits = 1
+
+[[ram.primitive.mode]]
+depth = 4096
+width_bits = 2
+
+[[ram.primitive.mode]]
+depth = 2048
+width_bits = 4
+
+[[ram.primitive.mode]]
+depth = 2048
+width_bits = 5
+
+[[ram.primitive.mode]]
+depth = 1024
+width_bits = 8
+
+[[ram.primitive.mode]]
+depth = 1024
+width_bits = 10
+
+[[ram.primitive.mode]]
+depth = 512
+width_bits = 16
+
+[[ram.primitive.mode]]
+depth = 512
+width_bits = 20
 
 [reserved]
 dsp48 = 8

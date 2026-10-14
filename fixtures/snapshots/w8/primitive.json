@@ -1,0 +1,424 @@
+{
+  "name": "fixture-w8",
+  "tensors": [
+    {
+      "id": 0,
+      "name": "p0.v0",
+      "shape": {
+        "n": 1,
+        "c": 3,
+        "h": 6,
+        "w": 6
+      },
+      "elem": "i8",
+      "code_range": {
+        "lo": -127,
+        "hi": 127
+      }
+    },
+    {
+      "id": 1,
+      "name": "weights:stem",
+      "shape": {
+        "n": 4,
+        "c": 3,
+        "h": 3,
+        "w": 3
+      },
+      "elem": "i8"
+    },
+    {
+      "id": 2,
+      "name": "bias:stem",
+      "shape": {
+        "n": 4,
+        "c": 1,
+        "h": 1,
+        "w": 1
+      },
+      "elem": "i32"
+    },
+    {
+      "id": 3,
+      "name": "p1.v0",
+      "shape": {
+        "n": 1,
+        "c": 4,
+        "h": 6,
+        "w": 6
+      },
+      "elem": "i8",
+      "code_range": {
+        "lo": 0,
+        "hi": 127
+      }
+    },
+    {
+      "id": 4,
+      "name": "weights:dw",
+      "shape": {
+        "n": 4,
+        "c": 1,
+        "h": 3,
+        "w": 3
+      },
+      "elem": "i8"
+    },
+    {
+      "id": 5,
+      "name": "p2.v0",
+      "shape": {
+        "n": 1,
+        "c": 4,
+        "h": 6,
+        "w": 6
+      },
+      "elem": "i8",
+      "code_range": {
+        "lo": 0,
+        "hi": 127
+      }
+    },
+    {
+      "id": 6,
+      "name": "weights:mid",
+      "shape": {
+        "n": 4,
+        "c": 4,
+        "h": 1,
+        "w": 1
+      },
+      "elem": "i8"
+    },
+    {
+      "id": 7,
+      "name": "p3.v0",
+      "shape": {
+        "n": 1,
+        "c": 4,
+        "h": 6,
+        "w": 6
+      },
+      "elem": "i8",
+      "code_range": {
+        "lo": 0,
+        "hi": 127
+      }
+    },
+    {
+      "id": 8,
+      "name": "p3.v1",
+      "shape": {
+        "n": 1,
+        "c": 4,
+        "h": 6,
+        "w": 6
+      },
+      "elem": "i9",
+      "code_range": {
+        "lo": 0,
+        "hi": 254
+      }
+    },
+    {
+      "id": 9,
+      "name": "p3.v2",
+      "shape": {
+        "n": 1,
+        "c": 4,
+        "h": 12,
+        "w": 12
+      },
+      "elem": "i9",
+      "code_range": {
+        "lo": 0,
+        "hi": 254
+      }
+    },
+    {
+      "id": 10,
+      "name": "weights:head",
+      "shape": {
+        "n": 3,
+        "c": 4,
+        "h": 1,
+        "w": 1
+      },
+      "elem": "i8"
+    },
+    {
+      "id": 11,
+      "name": "image.v0",
+      "shape": {
+        "n": 1,
+        "c": 3,
+        "h": 12,
+        "w": 12
+      },
+      "elem": "u8",
+      "code_range": {
+        "lo": 0,
+        "hi": 255
+      }
+    },
+    {
+      "id": 12,
+      "name": "output.u8",
+      "shape": {
+        "n": 1,
+        "c": 3,
+        "h": 12,
+        "w": 12
+      },
+      "elem": "u8",
+      "code_range": {
+        "lo": 0,
+        "hi": 255
+      }
+    }
+  ],
+  "ops": [
+    {
+      "name": "stem",
+      "kind": "conv2d",
+      "inputs": [
+        0
+      ],
+      "outputs": [
+        3
+      ],
+      "detail": {
+        "conv": {
+          "weights": 1,
+          "bias": 2,
+          "groups": 1,
+          "stride": [
+            1,
+            1
+          ],
+          "padding": "reflect",
+          "requant": {
+            "m0": 92275,
+            "shift": 22,
+            "rounding": "half_away_from_zero",
+            "saturate_lo": 0,
+            "saturate_hi": 127,
+            "per_channel_multipliers": [
+              23488,
+              46137,
+              71303,
+              92275
+            ],
+            "multiplier_error_ppm": 8
+          },
+          "activation": {
+            "kind": "relu",
+            "clamp_lo": 0,
+            "clamp_hi": 127
+          }
+        }
+      }
+    },
+    {
+      "name": "dw",
+      "kind": "depthwise_conv2d",
+      "inputs": [
+        3
+      ],
+      "outputs": [
+        5
+      ],
+      "detail": {
+        "conv": {
+          "weights": 4,
+          "groups": 4,
+          "stride": [
+            1,
+            1
+          ],
+          "padding": "reflect",
+          "requant": {
+            "m0": 83886,
+            "shift": 23,
+            "rounding": "half_away_from_zero",
+            "saturate_lo": 0,
+            "saturate_hi": 127,
+            "per_channel_multipliers": [
+              83886,
+              83886,
+              83886,
+              83886
+            ],
+            "multiplier_error_ppm": 1
+          },
+          "activation": {
+            "kind": "relu",
+            "clamp_lo": 0,
+            "clamp_hi": 127
+          }
+        }
+      }
+    },
+    {
+      "name": "mid",
+      "kind": "pointwise_conv2d",
+      "inputs": [
+        5
+      ],
+      "outputs": [
+        7
+      ],
+      "detail": {
+        "conv": {
+          "weights": 6,
+          "groups": 1,
+          "stride": [
+            1,
+            1
+          ],
+          "padding": {
+            "zero": {
+              "top": 0,
+              "bottom": 0,
+              "left": 0,
+              "right": 0
+            }
+          },
+          "requant": {
+            "m0": 83886,
+            "shift": 23,
+            "rounding": "half_away_from_zero",
+            "saturate_lo": 0,
+            "saturate_hi": 127,
+            "per_channel_multipliers": [
+              83886,
+              83886,
+              83886,
+              83886
+            ],
+            "multiplier_error_ppm": 1
+          },
+          "activation": {
+            "kind": "relu",
+            "clamp_lo": 0,
+            "clamp_hi": 127
+          }
+        }
+      }
+    },
+    {
+      "name": "add.3",
+      "kind": "add",
+      "inputs": [
+        7,
+        3
+      ],
+      "outputs": [
+        8
+      ],
+      "detail": {
+        "elementwise": {
+          "requant": {
+            "m0": 122334,
+            "shift": 18,
+            "rounding": "half_away_from_zero",
+            "saturate_lo": -127,
+            "saturate_hi": 127,
+            "multiplier_error_ppm": 2
+          },
+          "activation": {
+            "kind": "none",
+            "clamp_lo": -127,
+            "clamp_hi": 127
+          }
+        }
+      }
+    },
+    {
+      "name": "upsample_nearest2x.3",
+      "kind": "nearest_upsample2x",
+      "inputs": [
+        8
+      ],
+      "outputs": [
+        9
+      ],
+      "detail": {
+        "upsample": {
+          "scale": 2
+        }
+      }
+    },
+    {
+      "name": "head",
+      "kind": "pointwise_conv2d",
+      "inputs": [
+        9
+      ],
+      "outputs": [
+        11
+      ],
+      "detail": {
+        "conv": {
+          "weights": 10,
+          "groups": 1,
+          "stride": [
+            1,
+            1
+          ],
+          "padding": {
+            "zero": {
+              "top": 0,
+              "bottom": 0,
+              "left": 0,
+              "right": 0
+            }
+          },
+          "requant": {
+            "m0": 104858,
+            "shift": 20,
+            "rounding": "half_away_from_zero",
+            "saturate_lo": 0,
+            "saturate_hi": 255,
+            "per_channel_multipliers": [
+              104858,
+              104858,
+              104858
+            ],
+            "multiplier_error_ppm": 4
+          },
+          "activation": {
+            "kind": "unsigned_clamp",
+            "clamp_lo": 0,
+            "clamp_hi": 255
+          }
+        }
+      }
+    },
+    {
+      "name": "quantize_u8_output",
+      "kind": "quantize_output",
+      "inputs": [
+        11
+      ],
+      "outputs": [
+        12
+      ],
+      "detail": {
+        "elementwise": {
+          "activation": {
+            "kind": "unsigned_clamp",
+            "clamp_lo": 0,
+            "clamp_hi": 255
+          }
+        }
+      }
+    }
+  ],
+  "inputs": [
+    0
+  ],
+  "outputs": [
+    12
+  ]
+}

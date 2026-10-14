@@ -1,0 +1,46 @@
+# Acceptance policy for the acceptance graph fixture.
+#
+# Restricted to the schema the emitted full-graph backend consumes: one
+# shared-tile engine over an activation arena, frame granularity, single lane per
+# step, and on-chip BRAM as the only placement (the engine reads the arena at
+# computed addresses and instantiates no per-step line buffer, so a line-buffer or
+# DDR intermediate would describe a structure it does not have). Fusion is
+# disabled on top of that, so the schedule has exactly one step per lowered
+# operator and the RTL trace maps 1:1 onto the independent reference's operator
+# list.
+format = "tessera.policy"
+schema_version = 1
+operator_override = []
+
+[constraints]
+allow_cpu_layer_dispatch = false
+max_frame_cycles = 50000000
+# Exact against the compiled fixed-point contract, not the training f32
+require_bit_exact = true
+
+[fusion]
+allow = []
+forbid = ["fanout_value", "cross_ddr_boundary"]
+
+[hint]
+prefer_bram_over_ddr = false
+prefer_fusion = false
+prefer_shared_engines = false
+
+[memory]
+allow_ping_pong = true
+max_ping_pong_buffers = 2
+placements = ["bram"]
+
+[objective]
+primary = "minimize_cycles"
+secondary = ["minimize_ddr_bytes"]
+
+[search]
+execution_modes = ["shared_tile"]
+granularities = ["frame"]
+max_candidates = 200000
+seed = 20261015
+tile_heights = [16, 32, 48]
+tile_widths = [16, 32, 64]
+utilisation_percent = 85

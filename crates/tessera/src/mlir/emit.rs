@@ -9,7 +9,10 @@
 //!
 //! * a convolution accumulates `bias_int32[oc] + sum(input_code * weight_code)`
 //!   in `i32`; `linalg.fill` seeds the accumulator with zero and the bias is
-//!   added in the epilogue, which is the same integer sum;
+//!   added in the epilogue, which is the same integer sum. The explicit
+//!   `linalg.generic` form used for widened activations accumulates into its
+//!   `outs` operand exactly like the named form, so it takes the same zero-filled
+//!   seed — never an uninitialized `tensor.empty`;
 //! * requantization is `round_clamp(acc * requant[oc], lo, hi)` with
 //!   round-half-away-from-zero, emitted in the `(M0, shift)` fixed-point form
 //!   produced by [`super::quant`] and verified against the NNgen oracle;
@@ -32,9 +35,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use super::artifact::{
-    ArgumentRole, ArtifactMetrics, ElementType, FilterStorageLayout, LayerBinding, MlirArgument,
-    MlirError, MlirFilterLayout, MlirOptions, OperatorBinding, OperatorKind, PaddingSpec,
-    Quantization, TensorBinding, WeightPacking, WeightReference, tensor_type,
+    ArgumentRole, ArtifactMetrics, BiasContribution, CodeRange, ElementType, FilterStorageLayout,
+    LayerBinding, MlirArgument, MlirError, MlirFilterLayout, MlirOptions, OperatorBinding,
+    OperatorKind, PaddingSpec, Quantization, TensorBinding, WeightPacking, WeightReference,
+    tensor_type,
 };
 use super::quant::{ClampSpec, QuantError, RequantSpec, rounding_offsets};
 use crate::graph::{
@@ -47,8 +51,12 @@ use crate::graph::{
 pub struct EmittedModule {
     /// Textual MLIR, byte-for-byte deterministic for a given graph and options.
     pub module: String,
+    /// Concrete `NHWC` input shape the module was emitted for.
+    pub input_shape: Vec<u64>,
     /// Function arguments in declaration order.
     pub arguments: Vec<MlirArgument>,
+    /// Activation tensors the module names, in emission order.
+    pub tensors: Vec<TensorBinding>,
     /// Convolution layers in graph order.
     pub layers: Vec<LayerBinding>,
     /// Operators in execution order.
@@ -56,6 +64,31 @@ pub struct EmittedModule {
     /// Graph output tensor.
     pub output: TensorBinding,
     pub metrics: ArtifactMetrics,
+}
+
+/// Location namespace every Tessera-emitted operation carries.
+///
+/// The emitter tags each structural operation with `loc("tessera:<role>/<owner>")`
+/// so that, after bufferization, loop lowering and fusion, the *optimized* IR
+/// still says which layer or graph operator each affine loop body came from.
+/// This is the stable mapping the primitive lowering and the fusion analysis use:
+/// nothing recovers operator semantics by inspecting generated arithmetic.
+pub const LOC_TAG_PREFIX: &str = "tessera:";
+
+/// Role of the convolution itself.
+pub const TAG_CONV: &str = "conv";
+/// Role of the reflection/zero padding of a convolution input.
+pub const TAG_PAD: &str = "pad";
+/// Role of the requantization/saturation epilogue of a convolution.
+pub const TAG_EPILOGUE: &str = "epilogue";
+/// Role of an elementwise `add`.
+pub const TAG_ADD: &str = "add";
+/// Role of the nearest-neighbour 2x duplication.
+pub const TAG_UPSAMPLE: &str = "upsample";
+
+/// Render the location attribute for one tagged operation.
+fn loc(tag: &str) -> String {
+    format!(" loc(\"{LOC_TAG_PREFIX}{tag}\")")
 }
 
 /// Emit tensor-level MLIR for `graph`.
@@ -76,6 +109,30 @@ struct TensorRef {
     shape: Vec<u64>,
     element: ElementType,
     point: Option<u32>,
+    /// Exact interval of codes this value can hold.
+    code_range: CodeRange,
+}
+
+impl TensorRef {
+    /// Narrowest MLIR element type that transports the value: `i8` while the
+    /// codes fit a signed byte, `i16` otherwise. A widened value is never
+    /// narrowed, because the reference leaves an `add` sum unclamped
+    /// (`fpga_st_train/src/intref.rs:257-268`).
+    fn element_for(range: CodeRange) -> Result<ElementType, MlirError> {
+        if range.fits_i8() {
+            return Ok(ElementType::I8);
+        }
+        if range.lo >= i16::MIN as i64 && range.hi <= i16::MAX as i64 {
+            return Ok(ElementType::I16);
+        }
+        Err(MlirError::Unsupported {
+            feature: "activation code range".to_string(),
+            detail: format!(
+                "codes [{}, {}] need more than the 16-bit transport the v1 emitter supports",
+                range.lo, range.hi
+            ),
+        })
+    }
 }
 
 /// Padding mode of an emitted `tensor.pad`.
@@ -90,6 +147,8 @@ struct Emitter<'g> {
     options: &'g MlirOptions,
     body: String,
     arguments: Vec<MlirArgument>,
+    /// Every tensor value the module names, in emission order.
+    tensors_named: Vec<TensorBinding>,
     layers: Vec<LayerBinding>,
     operators: Vec<OperatorBinding>,
     /// Live activations, keyed by quantization point index.
@@ -106,15 +165,27 @@ struct Emitter<'g> {
 
 impl<'g> Emitter<'g> {
     fn new(graph: &'g Graph, options: &'g MlirOptions) -> Result<Self, MlirError> {
+        // `intref.rs:195-197` quantizes the input image onto point 0 with the
+        // symmetric clamp, so the whole module consumes codes in [-qmax, qmax].
+        let input_range = CodeRange::new(-(graph.act_qmax() as i64), graph.act_qmax() as i64);
         let input = TensorRef {
             ssa: "input".to_string(),
             shape: options.input_shape.clone(),
             element: ElementType::I8,
             point: Some(0),
+            code_range: input_range,
         };
         let mut used_prefixes = BTreeSet::new();
         used_prefixes.insert("input".to_string());
         used_prefixes.insert("zero_i32".to_string());
+        let input_binding = TensorBinding {
+            ssa_name: input.ssa.clone(),
+            shape: input.shape.clone(),
+            element: input.element,
+            point: input.point,
+            scale: graph.point_scale(PointId::new(0)),
+            code_range: Some(input_range),
+        };
         Ok(Emitter {
             graph,
             options,
@@ -127,6 +198,7 @@ impl<'g> Emitter<'g> {
                 layer: None,
                 weight: None,
             }],
+            tensors_named: vec![input_binding],
             layers: Vec::new(),
             operators: Vec::new(),
             points: BTreeMap::new(),
@@ -182,11 +254,14 @@ impl<'g> Emitter<'g> {
             element: output.element,
             point: output.point,
             scale,
+            code_range: Some(output.code_range),
         };
         let module = self.render_module(&output);
         Ok(EmittedModule {
             module,
+            input_shape: self.options.input_shape.clone(),
             arguments: self.arguments,
+            tensors: self.tensors_named,
             layers: self.layers,
             operators: self.operators,
             output: output_binding,
@@ -355,17 +430,28 @@ impl<'g> Emitter<'g> {
                 pad_amount,
                 mode,
                 &padded_shape,
+                source.element,
+                &format!("{TAG_PAD}#{index}"),
             );
             self.body.push_str(&text);
-            TensorRef {
+            let padded_ref = TensorRef {
                 ssa: ssa_name,
                 shape: padded_shape,
-                element: ElementType::I8,
+                element: source.element,
                 point: source.point,
-            }
+                code_range: source.code_range,
+            };
+            self.record(&padded_ref);
+            padded_ref
         } else {
             source.clone()
         };
+
+        // Legality: the emitted datapath accumulates in `i32`, so the worst-case
+        // magnitude of `bias + sum(code * weight)` must fit. The weight bound is
+        // the storage type's, because filter values live in the external blob and
+        // are never inlined into the module.
+        let acc_bound = accumulator_bound(&padded.code_range, layer, kind, kernel, in_channels)?;
 
         // 2. Filter argument.
         let mlir_layout = match kind {
@@ -438,29 +524,81 @@ impl<'g> Emitter<'g> {
                 empty = ssa(&acc_init),
             ),
         );
-        let op_name = match kind {
-            PlannerKind::DepthwiseConv2d => "linalg.depthwise_conv_2d_nhwc_hwc",
-            PlannerKind::Conv2d | PlannerKind::PointwiseConv2d => "linalg.conv_2d_nhwc_fhwc",
-        };
-        self.line(
-            2,
-            &format!(
-                "{acc} = {op} {{dilations = dense<1> : vector<2xi64>, strides = {strides}}} ins({input}, {filter} : {ptype}, {ftype}) outs({init} : {acc_type}) -> {acc_type}",
-                acc = ssa(&acc_ssa),
-                op = op_name,
-                strides = vector_attr(&stride),
-                input = ssa(&padded.ssa),
-                filter = ssa(&filter_ssa),
-                ptype = tensor_type(&padded.shape, ElementType::I8),
-                ftype = tensor_type(&filter_shape, ElementType::I8),
-                init = ssa(&acc_zero),
-            ),
-        );
+        // The named linalg convolutions take one element type for both the
+        // activation and the filter. A widened activation (codes outside a signed
+        // byte) is therefore lowered through an explicit `linalg.generic`
+        // convolution that widens the codes to the `i32` accumulator: same
+        // arithmetic, no narrowing, and no unnamed element type on a named op.
+        match padded.element {
+            ElementType::I8 => {
+                let op_name = match kind {
+                    PlannerKind::DepthwiseConv2d => "linalg.depthwise_conv_2d_nhwc_hwc",
+                    PlannerKind::Conv2d | PlannerKind::PointwiseConv2d => {
+                        "linalg.conv_2d_nhwc_fhwc"
+                    }
+                };
+                self.line(
+                    2,
+                    &format!(
+                        "{acc} = {op} {{dilations = dense<1> : vector<2xi64>, strides = {strides}}} ins({input}, {filter} : {ptype}, {ftype}) outs({init} : {acc_type}) -> {acc_type}{tag}",
+                        acc = ssa(&acc_ssa),
+                        op = op_name,
+                        strides = vector_attr(&stride),
+                        input = ssa(&padded.ssa),
+                        filter = ssa(&filter_ssa),
+                        ptype = tensor_type(&padded.shape, ElementType::I8),
+                        ftype = tensor_type(&filter_shape, ElementType::I8),
+                        init = ssa(&acc_zero),
+                        tag = loc(&format!("{TAG_CONV}#{index}")),
+                    ),
+                );
+            }
+            element => {
+                // The explicit convolution *accumulates into* its `outs` operand,
+                // exactly like the named form does. It therefore takes the same
+                // zero-filled accumulator: seeding it from an uninitialized
+                // `tensor.empty` would leave the sum of products on top of
+                // whatever the buffer happened to hold.
+                let mut text = String::new();
+                write_generic_conv(
+                    &mut text,
+                    2,
+                    &GenericConv {
+                        result: &acc_ssa,
+                        result_init: &acc_zero,
+                        source: &padded.ssa,
+                        filter: &filter_ssa,
+                        acc_type: &acc_type,
+                        source_shape: &padded.shape,
+                        filter_shape: &filter_shape,
+                        element,
+                        kind,
+                        stride,
+                    },
+                    &format!("{TAG_CONV}#{index}"),
+                );
+                self.body.push_str(&text);
+            }
+        }
+        self.record(&TensorRef {
+            ssa: acc_ssa.clone(),
+            shape: acc_shape.clone(),
+            element: ElementType::I32,
+            point: point_id_of(&layer.out_point),
+            code_range: CodeRange::new(-acc_bound, acc_bound),
+        });
 
         // 5. Requantization and saturation epilogue.
         let out_init = format!("{prefix}__out_init");
         let out_ssa = format!("{prefix}__out");
-        let out_type = tensor_type(&out_shape, ElementType::I8);
+        // The epilogue saturates, so the produced codes are the clamp's: the
+        // transport follows from the clamp, not from a fixed byte width.
+        let out_element = if clamp.unsigned {
+            ElementType::I8
+        } else {
+            TensorRef::element_for(CodeRange::new(clamp.lower, clamp.upper))?
+        };
+        let out_type = tensor_type(&out_shape, out_element);
         self.line(
             2,
             &format!(
@@ -481,6 +619,7 @@ impl<'g> Emitter<'g> {
                 acc_shape: &acc_shape,
                 out_shape: &out_shape,
                 requant: &requant,
+                tag: &format!("{TAG_EPILOGUE}#{index}"),
             },
         );
         self.body.push_str(&text);
@@ -488,9 +627,11 @@ impl<'g> Emitter<'g> {
         let out_ref = TensorRef {
             ssa: out_ssa.clone(),
             shape: out_shape,
-            element: ElementType::I8,
+            element: out_element,
             point: point_id_of(&layer.out_point),
+            code_range: CodeRange::new(clamp.lower, clamp.upper),
         };
+        self.record(&out_ref);
         self.tensors += 1;
         let elements = out_ref.shape.iter().product::<u64>();
         self.macs += elements * kernel[0] * kernel[1] * taps(kind, in_channels);
@@ -514,10 +655,12 @@ impl<'g> Emitter<'g> {
             stride: [stride[0] as u32, stride[1] as u32],
             quantization: requant.clone(),
             filter: weight,
+            bias: BiasContribution::of(&layer.bias_int32),
         });
         self.operators.push(OperatorBinding {
             index,
             kind: operator_kind(kind),
+            tag: format!("{TAG_CONV}#{index}"),
             layer: Some(layer_name),
             consumes: vec![source.ssa.clone()],
             produces: vec![out_ref.ssa],
@@ -554,6 +697,7 @@ impl<'g> Emitter<'g> {
         self.operators.push(OperatorBinding {
             index,
             kind: OperatorKind::Relu,
+            tag: format!("{}#{index}", OperatorKind::Relu.as_str()),
             layer: Some(layer.name.as_str().to_string()),
             consumes: Vec::new(),
             produces: Vec::new(),
@@ -624,7 +768,26 @@ impl<'g> Emitter<'g> {
         self.reserve_prefix_checked(&prefix)?;
         let out_ssa = format!("{prefix}__out");
         let out_init = format!("{prefix}__init");
-        let ty = tensor_type(&trunk.shape, ElementType::I8);
+        // The reference requantizes and clamps only the branch and leaves the sum
+        // unclamped (`intref.rs:257-268`), so the result carries the *sum* of the
+        // two operand intervals. The branch interval is the source interval
+        // squeezed by the requantization clamp: the emitted datapath clamps it to
+        // `[lower, upper]`, and a factor at most one cannot move a code outside the
+        // interval it came from, so the intersection is exact. A factor above one
+        // would widen, and then only the clamp bounds the branch.
+        let branch_range = if factor <= 1.0 {
+            CodeRange::new(
+                branch.code_range.lo.max(spec.clamp.lower),
+                branch.code_range.hi.min(spec.clamp.upper),
+            )
+        } else {
+            CodeRange::new(spec.clamp.lower, spec.clamp.upper)
+        };
+        let out_range = trunk.code_range.sum(branch_range);
+        // Resolved before emitting, so the writer and the recorded binding always
+        // agree on the transport type.
+        let out_element = TensorRef::element_for(out_range)?;
+        let ty = tensor_type(&trunk.shape, out_element);
         self.line(
             2,
             &format!("{empty} = tensor.empty() : {ty}", empty = ssa(&out_init)),
@@ -640,6 +803,10 @@ impl<'g> Emitter<'g> {
                 branch: &branch.ssa,
                 shape: &trunk.shape,
                 spec: &spec,
+                trunk_element: trunk.element,
+                branch_element: branch.element,
+                result_element: out_element,
+                tag: &format!("{TAG_ADD}#{index}"),
             },
         );
         self.body.push_str(&text);
@@ -647,15 +814,18 @@ impl<'g> Emitter<'g> {
         let out_ref = TensorRef {
             ssa: out_ssa.clone(),
             shape: trunk.shape.clone(),
-            element: ElementType::I8,
+            element: out_element,
             point: Some(point),
+            code_range: out_range,
         };
+        self.record(&out_ref);
         self.tensors += 1;
         self.requantizations += trunk.shape.iter().product::<u64>();
         self.points.insert(point, out_ref.clone());
         self.operators.push(OperatorBinding {
             index,
             kind: OperatorKind::Add,
+            tag: format!("{TAG_ADD}#{index}"),
             layer: None,
             consumes: vec![trunk.ssa, branch.ssa],
             produces: vec![out_ref.ssa],
@@ -695,7 +865,7 @@ impl<'g> Emitter<'g> {
         self.reserve_prefix_checked(&prefix)?;
         let out_ssa = format!("{prefix}__out");
         let out_init = format!("{prefix}__init");
-        let out_type = tensor_type(&out_shape, ElementType::I8);
+        let out_type = tensor_type(&out_shape, source.element);
         self.line(
             2,
             &format!(
@@ -712,21 +882,27 @@ impl<'g> Emitter<'g> {
                 result_init: &out_init,
                 source: &source.ssa,
                 out_shape: &out_shape,
+                element: source.element,
+                tag: &format!("{TAG_UPSAMPLE}#{index}"),
             },
         );
         self.body.push_str(&text);
 
+        // Duplication changes no code, so the range travels with the value.
         let out_ref = TensorRef {
             ssa: out_ssa.clone(),
             shape: out_shape,
-            element: ElementType::I8,
+            element: source.element,
             point: Some(point),
+            code_range: source.code_range,
         };
+        self.record(&out_ref);
         self.tensors += 1;
         self.points.insert(point, out_ref.clone());
         self.operators.push(OperatorBinding {
             index,
             kind: OperatorKind::UpsampleNearest2x,
+            tag: format!("{TAG_UPSAMPLE}#{index}"),
             layer: None,
             consumes: vec![source.ssa],
             produces: vec![out_ref.ssa],
@@ -745,6 +921,7 @@ impl<'g> Emitter<'g> {
         self.operators.push(OperatorBinding {
             index,
             kind: OperatorKind::QuantizeU8,
+            tag: format!("{}#{index}", OperatorKind::QuantizeU8.as_str()),
             layer: None,
             consumes: vec![image.ssa.clone()],
             produces: Vec::new(),
@@ -850,6 +1027,32 @@ impl<'g> Emitter<'g> {
 
     fn line(&mut self, indent: usize, text: &str) {
         push_line(&mut self.body, indent, text);
+    }
+
+    /// Name a tensor value in the artifact's tensor table.
+    ///
+    /// Every value the module refers to by SSA name is recorded once, in
+    /// emission order, so a later stage can resolve an operator's operands and
+    /// results to shapes and element types without re-deriving them from the
+    /// graph (or from generated arithmetic).
+    fn record(&mut self, reference: &TensorRef) {
+        if self
+            .tensors_named
+            .iter()
+            .any(|named| named.ssa_name == reference.ssa)
+        {
+            return;
+        }
+        self.tensors_named.push(TensorBinding {
+            ssa_name: reference.ssa.clone(),
+            shape: reference.shape.clone(),
+            element: reference.element,
+            point: reference.point,
+            scale: reference
+                .point
+                .and_then(|point| self.graph.point_scale(PointId::new(point))),
+            code_range: Some(reference.code_range),
+        });
     }
 
     fn render_module(&self, output: &TensorRef) -> String {
@@ -1124,6 +1327,7 @@ fn tensor_binding(reference: &TensorRef) -> TensorBinding {
         element: reference.element,
         point: reference.point,
         scale: None,
+        code_range: Some(reference.code_range),
     }
 }
 
@@ -1220,9 +1424,11 @@ fn write_pad(
     amount: u32,
     mode: PadMode,
     out_shape: &[u64],
+    element: ElementType,
+    tag: &str,
 ) {
-    let source_type = tensor_type(source_shape, ElementType::I8);
-    let out_type = tensor_type(out_shape, ElementType::I8);
+    let source_type = tensor_type(source_shape, element);
+    let out_type = tensor_type(out_shape, element);
     push_line(
         text,
         indent,
@@ -1241,8 +1447,16 @@ fn write_pad(
     let inner = block + 1;
     match mode {
         PadMode::Zero => {
-            push_line(text, inner, "%zero = arith.constant 0 : i8");
-            push_line(text, inner, "tensor.yield %zero : i8");
+            push_line(
+                text,
+                inner,
+                &format!("%zero = arith.constant 0 : {}", element.mlir()),
+            );
+            push_line(
+                text,
+                inner,
+                &format!("tensor.yield %zero : {}", element.mlir()),
+            );
         }
         PadMode::Reflect => {
             let mut reflections = Vec::new();
@@ -1331,10 +1545,18 @@ fn write_pad(
                     source = ssa(source),
                 ),
             );
-            push_line(text, inner, "tensor.yield %value : i8");
+            push_line(
+                text,
+                inner,
+                &format!("tensor.yield %value : {}", element.mlir()),
+            );
         }
     }
-    push_line(text, indent, &format!("}} : {source_type} to {out_type}"));
+    push_line(
+        text,
+        indent,
+        &format!("}} : {source_type} to {out_type}{}", loc(tag)),
+    );
 }
 
 struct ConvEpilogue<'a> {
@@ -1346,6 +1568,8 @@ struct ConvEpilogue<'a> {
     acc_shape: &'a [u64],
     out_shape: &'a [u64],
     requant: &'a Quantization,
+    /// Tessera location tag identifying the layer this epilogue belongs to.
+    tag: &'a str,
 }
 
 /// Requantization and saturation epilogue of a convolution.
@@ -1395,7 +1619,11 @@ fn write_conv_epilogue(text: &mut String, indent: usize, epilogue: &ConvEpilogue
         epilogue.requant.clamp,
     );
     push_line(text, inner, "linalg.yield %narrow : i8");
-    push_line(text, indent, &format!("}} -> {out_type}"));
+    push_line(
+        text,
+        indent,
+        &format!("}} -> {out_type}{}", loc(epilogue.tag)),
+    );
 }
 
 struct AddOp<'a> {
@@ -1405,18 +1633,28 @@ struct AddOp<'a> {
     branch: &'a str,
     shape: &'a [u64],
     spec: &'a RequantSpec,
+    /// Element type of the trunk operand.
+    trunk_element: ElementType,
+    /// Element type of the branch operand.
+    branch_element: ElementType,
+    /// Element type of the result: the sum's transport, never narrowed.
+    result_element: ElementType,
+    /// Tessera location tag identifying the graph operator this add implements.
+    tag: &'a str,
 }
 
 /// Elementwise `add` with the branch requantized onto the destination grid and
 /// clamped, and the sum left unclamped (`intref.rs:257-268`).
 fn write_add(text: &mut String, indent: usize, op: &AddOp<'_>) {
-    let ty = tensor_type(op.shape, ElementType::I8);
+    let ty = tensor_type(op.shape, op.result_element);
+    let trunk_ty = tensor_type(op.shape, op.trunk_element);
+    let branch_ty = tensor_type(op.shape, op.branch_element);
     let maps = [identity_map(4), identity_map(4), identity_map(4)];
     push_line(
         text,
         indent,
         &format!(
-            "{result} = linalg.generic {{indexing_maps = [{maps}], iterator_types = {iters}}} ins({trunk}, {branch} : {ty}, {ty}) outs({init} : {ty}) {{",
+            "{result} = linalg.generic {{indexing_maps = [{maps}], iterator_types = {iters}}} ins({trunk}, {branch} : {trunk_ty}, {branch_ty}) outs({init} : {ty}) {{",
             result = ssa(op.result),
             maps = maps.join(", "),
             iters = parallel_iters(4),
@@ -1426,9 +1664,26 @@ fn write_add(text: &mut String, indent: usize, op: &AddOp<'_>) {
         ),
     );
     let block = indent + 1;
-    push_line(text, block, "^bb0(%trunk: i8, %branch: i8, %old: i8):");
+    let result_element = op.result_element.mlir();
+    push_line(
+        text,
+        block,
+        &format!(
+            "^bb0(%trunk: {trunk}, %branch: {branch}, %old: {result}):",
+            trunk = op.trunk_element.mlir(),
+            branch = op.branch_element.mlir(),
+            result = result_element,
+        ),
+    );
     let inner = block + 1;
-    push_line(text, inner, "%branch32 = arith.extsi %branch : i8 to i32");
+    push_line(
+        text,
+        inner,
+        &format!(
+            "%branch32 = arith.extsi %branch : {} to i32",
+            op.branch_element.mlir()
+        ),
+    );
     push_line(
         text,
         inner,
@@ -1448,12 +1703,29 @@ fn write_add(text: &mut String, indent: usize, op: &AddOp<'_>) {
         op.spec.shift,
         op.spec.clamp,
     );
-    push_line(text, inner, "%trunk32 = arith.extsi %trunk : i8 to i32");
+    push_line(
+        text,
+        inner,
+        &format!(
+            "%trunk32 = arith.extsi %trunk : {} to i32",
+            op.trunk_element.mlir()
+        ),
+    );
     push_line(text, inner, "%narrow32 = arith.extsi %narrow : i8 to i32");
     push_line(text, inner, "%sum32 = arith.addi %trunk32, %narrow32 : i32");
-    push_line(text, inner, "%sum8 = arith.trunci %sum32 : i32 to i8");
-    push_line(text, inner, "linalg.yield %sum8 : i8");
-    push_line(text, indent, &format!("}} -> {ty}"));
+    // The sum is not clamped (`intref.rs:257-268`); it is narrowed to the sum's
+    // transport width, which the caller sized to hold both operands.
+    push_line(
+        text,
+        inner,
+        &format!("%sum = arith.trunci %sum32 : i32 to {result_element}"),
+    );
+    push_line(
+        text,
+        inner,
+        &format!("linalg.yield %sum : {result_element}"),
+    );
+    push_line(text, indent, &format!("}} -> {ty}{}", loc(op.tag)));
 }
 
 /// Shared requantization arithmetic: multiply, round half away from zero,
@@ -1535,11 +1807,159 @@ fn write_requant_arithmetic(
     );
 }
 
+/// Worst-case magnitude of a convolution accumulator.
+///
+/// The emitted datapath accumulates in `i32`, so the module is only legal while
+/// `|bias| + taps * |weight| * |code|` fits. Weights live in the external blob
+/// and are never inlined here, so the bound uses the storage type's maximum
+/// magnitude, which is the tightest bound the artifact can prove without reading
+/// the blob.
+fn accumulator_bound(
+    input: &CodeRange,
+    layer: &Layer,
+    kind: PlannerKind,
+    kernel: [u64; 2],
+    in_channels: u32,
+) -> Result<i64, MlirError> {
+    let weight_bound: i64 = match layer.weight_bits.get() {
+        8 => i8::MAX as i64,
+        4 => 7,
+        bits => {
+            return Err(MlirError::Unsupported {
+                feature: "weight width".to_string(),
+                detail: format!(
+                    "layer {}: weight width {bits} is outside the v1 set {{4, 8}}",
+                    layer.name.as_str()
+                ),
+            });
+        }
+    };
+    let code_bound = input.lo.unsigned_abs().max(input.hi.unsigned_abs()) as i64;
+    let taps = (kernel[0] * kernel[1]).saturating_mul(taps(kind, in_channels));
+    let bias_bound = layer
+        .bias_int32
+        .iter()
+        .map(|value| i64::from(*value).unsigned_abs() as i64)
+        .max()
+        .unwrap_or(0);
+    let bound = bias_bound.saturating_add(
+        (taps as i64)
+            .saturating_mul(weight_bound)
+            .saturating_mul(code_bound),
+    );
+    if bound > i32::MAX as i64 {
+        return Err(MlirError::Unsupported {
+            feature: "accumulator width".to_string(),
+            detail: format!(
+                "layer {}: worst-case accumulator magnitude {bound} exceeds the i32 datapath \
+                 (taps {taps}, |weight| <= {weight_bound}, |code| <= {code_bound}, |bias| <= {bias_bound})",
+                layer.name.as_str()
+            ),
+        });
+    }
+    Ok(bound)
+}
+
+/// An explicit convolution for activations the named linalg form cannot express.
+///
+/// `linalg.conv_2d_nhwc_fhwc` and `linalg.depthwise_conv_2d_nhwc_hwc` take one
+/// element type for the activation and the filter. When a point holds widened
+/// codes, the activation is `i16` while the filter stays `i8`, so the
+/// convolution is written out as a `linalg.generic` whose body widens both
+/// operands to the `i32` accumulator. The arithmetic is the reference's:
+/// `acc += code * weight` with no narrowing of the codes.
+struct GenericConv<'a> {
+    result: &'a str,
+    result_init: &'a str,
+    source: &'a str,
+    filter: &'a str,
+    acc_type: &'a str,
+    source_shape: &'a [u64],
+    filter_shape: &'a [u64],
+    /// Element type of the activation operand.
+    element: ElementType,
+    kind: PlannerKind,
+    stride: [u64; 2],
+}
+
+fn write_generic_conv(text: &mut String, indent: usize, op: &GenericConv<'_>, tag: &str) {
+    let source_type = tensor_type(op.source_shape, op.element);
+    let filter_type = tensor_type(op.filter_shape, ElementType::I8);
+    let (input_map, filter_map) = match op.kind {
+        PlannerKind::DepthwiseConv2d => (
+            format!(
+                "affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d0, d1 * {sh} + d4, d2 * {sw} + d5, d3)>",
+                sh = op.stride[0],
+                sw = op.stride[1],
+            ),
+            "affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d4, d5, d3)>".to_string(),
+        ),
+        PlannerKind::Conv2d | PlannerKind::PointwiseConv2d => (
+            format!(
+                "affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d0, d1 * {sh} + d4, d2 * {sw} + d5, d6)>",
+                sh = op.stride[0],
+                sw = op.stride[1],
+            ),
+            "affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d3, d4, d5, d6)>".to_string(),
+        ),
+    };
+    let output_map = "affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d0, d1, d2, d3)>";
+    let iters = r#"["parallel", "parallel", "parallel", "parallel", "reduction", "reduction", "reduction"]"#;
+    push_line(
+        text,
+        indent,
+        &format!(
+            "{result} = linalg.generic {{indexing_maps = [{maps}], iterator_types = {iters}}} ins({source}, {filter} : {source_type}, {filter_type}) outs({init} : {acc}) {{",
+            result = ssa(op.result),
+            maps = [input_map, filter_map, output_map.to_string()].join(", "),
+            source = ssa(op.source),
+            filter = ssa(op.filter),
+            init = ssa(op.result_init),
+            acc = op.acc_type,
+        ),
+    );
+    let block = indent + 1;
+    push_line(
+        text,
+        block,
+        &format!(
+            "^bb0(%activation: {element}, %weight: i8, %accumulator: i32):",
+            element = op.element.mlir()
+        ),
+    );
+    let inner = block + 1;
+    push_line(
+        text,
+        inner,
+        &format!(
+            "%activation32 = arith.extsi %activation : {} to i32",
+            op.element.mlir()
+        ),
+    );
+    push_line(text, inner, "%weight32 = arith.extsi %weight : i8 to i32");
+    push_line(
+        text,
+        inner,
+        "%product = arith.muli %activation32, %weight32 : i32",
+    );
+    push_line(
+        text,
+        inner,
+        "%sum = arith.addi %accumulator, %product : i32",
+    );
+    push_line(text, inner, "linalg.yield %sum : i32");
+    push_line(text, indent, &format!("}} -> {}{}", op.acc_type, loc(tag)));
+}
+
 struct Upsample<'a> {
     result: &'a str,
     result_init: &'a str,
     source: &'a str,
     out_shape: &'a [u64],
+    /// Element type of the source; duplication never changes the transport.
+    element: ElementType,
+    /// Tessera location tag identifying the graph operator this reads for.
+    tag: &'a str,
 }
 
 /// Nearest-neighbour 2x duplication as a broadcast read.
@@ -1550,8 +1970,8 @@ fn write_upsample(text: &mut String, indent: usize, op: &Upsample<'_>) {
         op.out_shape[2] / 2,
         op.out_shape[3],
     ];
-    let in_type = tensor_type(&in_shape, ElementType::I8);
-    let out_type = tensor_type(op.out_shape, ElementType::I8);
+    let in_type = tensor_type(&in_shape, op.element);
+    let out_type = tensor_type(op.out_shape, op.element);
     let read_map =
         "affine_map<(d0, d1, d2, d3) -> (d0, d1 floordiv 2, d2 floordiv 2, d3)>".to_string();
     let maps = [read_map, identity_map(4)];
@@ -1568,9 +1988,14 @@ fn write_upsample(text: &mut String, indent: usize, op: &Upsample<'_>) {
         ),
     );
     let block = indent + 1;
-    push_line(text, block, "^bb0(%value: i8, %old: i8):");
-    push_line(text, block + 1, "linalg.yield %value : i8");
-    push_line(text, indent, &format!("}} -> {out_type}"));
+    let element = op.element.mlir();
+    push_line(
+        text,
+        block,
+        &format!("^bb0(%value: {element}, %old: {element}):"),
+    );
+    push_line(text, block + 1, &format!("linalg.yield %value : {element}"));
+    push_line(text, indent, &format!("}} -> {out_type}{}", loc(op.tag)));
 }
 
 #[cfg(test)]
@@ -1751,6 +2176,8 @@ mod tests {
             1,
             PadMode::Reflect,
             &[1, 34, 34, 3],
+            ElementType::I8,
+            &format!("{TAG_PAD}#0"),
         );
         let mut second = String::new();
         write_pad(
@@ -1762,6 +2189,8 @@ mod tests {
             1,
             PadMode::Reflect,
             &[1, 34, 34, 3],
+            ElementType::I8,
+            &format!("{TAG_PAD}#0"),
         );
         assert_eq!(first, second);
         assert!(first.contains("tensor.pad %input low[0, 1, 1, 0] high[0, 1, 1, 0]"));
@@ -1785,6 +2214,8 @@ mod tests {
             2,
             PadMode::Zero,
             &[1, 12, 12, 4],
+            ElementType::I8,
+            &format!("{TAG_PAD}#0"),
         );
         assert!(text.contains("low[0, 2, 2, 0] high[0, 2, 2, 0]"));
         assert!(text.contains("%zero = arith.constant 0 : i8"));
@@ -1807,6 +2238,7 @@ mod tests {
                 acc_shape: &[1, 32, 32, 32],
                 out_shape: &[1, 32, 32, 32],
                 requant: &quantization,
+                tag: &format!("{TAG_EPILOGUE}#0"),
             },
         );
         assert!(text.contains("%round_positive = arith.constant 33554432 : i64"));
@@ -1835,6 +2267,7 @@ mod tests {
                 acc_shape: &[1, 8, 8, 3],
                 out_shape: &[1, 8, 8, 3],
                 requant: &quantization,
+                tag: &format!("{TAG_EPILOGUE}#0"),
             },
         );
         // `arith` accepts only signless integers, so unsigned codes are the same
@@ -1859,6 +2292,10 @@ mod tests {
                 branch: "res_0_c2__out",
                 shape: &[1, 16, 16, 32],
                 spec: &spec,
+                trunk_element: ElementType::I8,
+                branch_element: ElementType::I8,
+                result_element: ElementType::I16,
+                tag: &format!("{TAG_ADD}#3"),
             },
         );
         assert!(text.contains(
@@ -1883,6 +2320,8 @@ mod tests {
                 result_init: "up_5__init",
                 source: "up3_1__out",
                 out_shape: &[1, 16, 16, 32],
+                element: ElementType::I8,
+                tag: &format!("{TAG_UPSAMPLE}#5"),
             },
         );
         assert!(

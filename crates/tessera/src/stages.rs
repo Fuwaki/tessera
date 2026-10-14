@@ -29,6 +29,7 @@ use crate::graph::GraphArtifact;
 use crate::layout::{ExecutionPlan, LayoutArtifact};
 use crate::mlir::MlirArtifact;
 use crate::planner::PlanInput;
+use crate::primitive::PrimitiveArtifact;
 use crate::rtl::RtlMetadata;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -47,8 +48,10 @@ pub const OPTIMIZED_MODULE_FILE: &str = "optimized.mlir";
 pub const TARGET_FILE: &str = "target.toml";
 /// Copy of the policy file a layout was solved against.
 pub const POLICY_FILE: &str = "policy.toml";
-/// Lowered planner input.
+/// Lowered planner input (`PlanInput`, the planner's own contract).
 pub const PRIMITIVE_FILE: &str = "primitive.json";
+/// Lowered primitive graph with its evidence (`tessera.primitive`).
+pub const PRIMITIVES_FILE: &str = "primitives.json";
 /// Concrete input activation shape recorded during `import` as `N,H,W,C`.
 pub const INPUT_SHAPE_FILE: &str = "input_shape.txt";
 /// Solved layout artifact.
@@ -154,6 +157,8 @@ pub enum ArtifactKind {
     RtlBundle,
     /// A lowered primitive graph (`PlanInput`), which has no format tag.
     Primitive,
+    /// A lowered primitive graph with its evidence (`tessera.primitive`).
+    PrimitiveArtifact,
 }
 
 impl ArtifactKind {
@@ -166,6 +171,7 @@ impl ArtifactKind {
             ArtifactKind::Plan => "execution_plan",
             ArtifactKind::RtlBundle => "rtl_bundle",
             ArtifactKind::Primitive => "primitive",
+            ArtifactKind::PrimitiveArtifact => "primitive_artifact",
         }
     }
 }
@@ -184,6 +190,7 @@ pub fn detect_kind(text: &str) -> Option<ArtifactKind> {
                 crate::graph::GRAPH_FORMAT => Some(ArtifactKind::Graph),
                 crate::mlir::MLIR_ARTIFACT_FORMAT => Some(ArtifactKind::Mlir),
                 crate::rtl::RTL_BUNDLE_FORMAT => Some(ArtifactKind::RtlBundle),
+                crate::primitive::PRIMITIVE_FORMAT => Some(ArtifactKind::PrimitiveArtifact),
                 _ => None,
             };
         }
@@ -324,9 +331,29 @@ pub fn load_rtl_metadata(dir: &StageDir) -> Result<Option<RtlMetadata>, ChainErr
         })
 }
 
-/// Load a lowered primitive graph written by `tessera solve --primitive`.
+/// Load a lowered primitive graph written by `tessera solve`.
+///
+/// Both forms are accepted: the plain planner contract (`primitive.json`) and the
+/// evidence-carrying `tessera.primitive` artifact (`primitives.json`), whose
+/// `plan` is what the planner consumes.
 pub fn load_primitive(dir: &StageDir) -> Result<Option<PlanInput>, ChainError> {
-    let path = dir.path(PRIMITIVE_FILE);
+    for name in [PRIMITIVE_FILE, PRIMITIVES_FILE] {
+        let path = dir.path(name);
+        if !path.exists() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).map_err(|error| ChainError::Io {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        })?;
+        return parse_primitive_stage(&text, name).map(Some);
+    }
+    Ok(None)
+}
+
+/// Load the evidence-carrying primitive artifact, when one was written.
+pub fn load_primitive_artifact(dir: &StageDir) -> Result<Option<PrimitiveArtifact>, ChainError> {
+    let path = dir.path(PRIMITIVES_FILE);
     if !path.exists() {
         return Ok(None);
     }
@@ -334,19 +361,39 @@ pub fn load_primitive(dir: &StageDir) -> Result<Option<PlanInput>, ChainError> {
         path: path.display().to_string(),
         detail: error.to_string(),
     })?;
-    parse_primitive(&text).map(Some)
-}
-
-/// Parse a `PlanInput` document and validate it.
-pub fn parse_primitive(text: &str) -> Result<PlanInput, ChainError> {
-    let plan: PlanInput = serde_json::from_str(text).map_err(|error| ChainError::Malformed {
-        stage: PRIMITIVE_FILE,
+    let artifact = PrimitiveArtifact::from_json(&text).map_err(|error| ChainError::Malformed {
+        stage: PRIMITIVES_FILE,
         detail: error.to_string(),
     })?;
-    plan.validate().map_err(|detail| ChainError::Malformed {
-        stage: PRIMITIVE_FILE,
-        detail,
+    artifact
+        .validate_header()
+        .map_err(|error| ChainError::Malformed {
+            stage: PRIMITIVES_FILE,
+            detail: error.to_string(),
+        })?;
+    Ok(Some(artifact))
+}
+
+/// Parse a primitive document (either form) and validate it.
+pub fn parse_primitive(text: &str) -> Result<PlanInput, ChainError> {
+    parse_primitive_stage(text, PRIMITIVE_FILE)
+}
+
+fn parse_primitive_stage(text: &str, stage: &'static str) -> Result<PlanInput, ChainError> {
+    if detect_kind(text) == Some(ArtifactKind::PrimitiveArtifact) {
+        let artifact =
+            PrimitiveArtifact::from_json(text).map_err(|error| ChainError::Malformed {
+                stage,
+                detail: error.to_string(),
+            })?;
+        return Ok(artifact.plan);
+    }
+    let plan: PlanInput = serde_json::from_str(text).map_err(|error| ChainError::Malformed {
+        stage,
+        detail: error.to_string(),
     })?;
+    plan.validate()
+        .map_err(|detail| ChainError::Malformed { stage, detail })?;
     Ok(plan)
 }
 
@@ -373,6 +420,7 @@ pub fn verify_chain(dir: &StageDir) -> Result<Vec<ChainCheck>, ChainError> {
     let optimized = load_mlir(dir, OPTIMIZED_FILE)?;
     let layout = load_layout(dir)?;
     let plan = load_plan(dir)?;
+    let primitives = load_primitive_artifact(dir)?;
     let rtl = load_rtl_metadata(dir)?;
 
     if let Some(graph) = &graph {
@@ -390,36 +438,33 @@ pub fn verify_chain(dir: &StageDir) -> Result<Vec<ChainCheck>, ChainError> {
         });
     }
 
-    if let (Some(graph), Some(mlir)) = (&graph, &mlir) {
-        let hash_ok = mlir.provenance.source_content_hash == graph.provenance.manifest_sha256;
-        let format_ok = mlir.provenance.source_format == graph.format
-            && mlir.provenance.source_schema_version == graph.schema_version;
-        checks.push(ChainCheck {
-            stage: "mlir",
-            check: "descends from graph artifact".to_string(),
-            ok: hash_ok && format_ok,
-            detail: if hash_ok && format_ok {
-                format!(
-                    "{} schema {}, manifest hash {}",
-                    mlir.provenance.source_format,
-                    mlir.provenance.source_schema_version,
-                    short(&mlir.provenance.source_content_hash)
-                )
-            } else {
-                format!(
-                    "mlir records source {} schema {} hash {}, graph artifact is {} schema {} with \
-                     manifest hash {}",
-                    mlir.provenance.source_format,
-                    mlir.provenance.source_schema_version,
-                    short(&mlir.provenance.source_content_hash),
-                    graph.format,
-                    graph.schema_version,
-                    short(&graph.provenance.manifest_sha256)
-                )
-            },
-        });
+    // The MLIR artifacts own their integrity checks: the module text is
+    // re-hashed against the recorded hash, the recorded source graph is compared
+    // with the staged one, and the embedded analysis is re-derived and compared
+    // field by field (which needs the `melior` feature; a build without it reports
+    // that check as failed rather than trusting the metadata). They are run here
+    // rather than re-implemented, so `verify` and the artifact agree on what
+    // integrity means and a gap is reported once.
+    for artifact in [&mlir, &optimized].into_iter().flatten() {
+        match artifact.verify(graph.as_ref()) {
+            Ok(provenance) => {
+                for check in provenance {
+                    checks.push(ChainCheck {
+                        stage: "mlir",
+                        check: check.check,
+                        ok: check.ok,
+                        detail: check.detail,
+                    });
+                }
+            }
+            Err(error) => checks.push(ChainCheck {
+                stage: "mlir",
+                check: "artifact integrity".to_string(),
+                ok: false,
+                detail: error.to_string(),
+            }),
+        }
     }
-
     if let (Some(mlir), Some(optimized)) = (&mlir, &optimized) {
         let ok = optimized.provenance.melior.is_some()
             && optimized.provenance.source_content_hash == mlir.provenance.source_content_hash;
@@ -440,40 +485,58 @@ pub fn verify_chain(dir: &StageDir) -> Result<Vec<ChainCheck>, ChainError> {
     }
 
     if let Some(layout) = &layout {
-        // The layout records the hash of the artifact it was solved from, which
-        // is `graph.tgraph` for a manifest import and `primitive.json` for a
-        // directly-solved primitive graph.
-        let graph_input = if dir.exists(GRAPH_FILE) {
-            Some(GRAPH_FILE)
-        } else if dir.exists(PRIMITIVE_FILE) {
-            Some(PRIMITIVE_FILE)
-        } else {
-            None
-        };
-        match graph_input {
-            Some(file) => {
-                let actual = dir.sha256(file)?;
-                let ok = actual == layout.provenance.graph_sha256;
-                checks.push(ChainCheck {
-                    stage: "layout",
-                    check: "solved-from input hash".to_string(),
-                    ok,
-                    detail: if ok {
-                        format!("{file} matches {}", short(&layout.provenance.graph_sha256))
-                    } else {
-                        format!(
-                            "{file} hashes to {} but the layout records {}",
-                            short(&actual),
-                            short(&layout.provenance.graph_sha256)
-                        )
-                    },
-                });
+        // The layout records the hash of the artifact it was solved from: the
+        // graph artifact, the optimized MLIR artifact, or a primitive graph. A
+        // stage directory may hold several of them (a solve can follow an
+        // import), so the hash decides which one the layout descends from
+        // instead of a fixed preference order.
+        let candidates = [
+            GRAPH_FILE,
+            OPTIMIZED_FILE,
+            MLIR_FILE,
+            PRIMITIVE_FILE,
+            PRIMITIVES_FILE,
+        ];
+        let mut matched: Option<&'static str> = None;
+        let mut present: Vec<(&'static str, String)> = Vec::new();
+        for file in candidates {
+            if !dir.exists(file) {
+                continue;
             }
+            let actual = dir.sha256(file)?;
+            if actual == layout.provenance.graph_sha256 {
+                matched = Some(file);
+                break;
+            }
+            present.push((file, actual));
+        }
+        match matched {
+            Some(file) => checks.push(ChainCheck {
+                stage: "layout",
+                check: "solved-from input hash".to_string(),
+                ok: true,
+                detail: format!("{file} matches {}", short(&layout.provenance.graph_sha256)),
+            }),
             None => checks.push(ChainCheck {
                 stage: "layout",
-                check: "solved-from input copy present".to_string(),
+                check: "solved-from input hash".to_string(),
                 ok: false,
-                detail: format!("neither {GRAPH_FILE} nor {PRIMITIVE_FILE} is in the directory"),
+                detail: if present.is_empty() {
+                    format!(
+                        "none of {} is in the directory, so the layout's input cannot be re-checked",
+                        candidates.join(", ")
+                    )
+                } else {
+                    format!(
+                        "the layout records {}; {}",
+                        short(&layout.provenance.graph_sha256),
+                        present
+                            .iter()
+                            .map(|(file, hash)| format!("{file} hashes to {}", short(hash)))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                },
             }),
         }
         for (file, recorded, what) in [
@@ -506,6 +569,107 @@ pub fn verify_chain(dir: &StageDir) -> Result<Vec<ChainCheck>, ChainError> {
                 },
             });
         }
+    }
+
+    if let (Some(primitives), Some(optimized)) = (&primitives, &optimized) {
+        let linked = primitives.check(optimized);
+        checks.push(ChainCheck {
+            stage: "primitives",
+            check: "descends from the optimized module".to_string(),
+            ok: linked.is_ok(),
+            detail: match linked {
+                Ok(()) => format!(
+                    "{} operators, {} fusion groups ({} fused), {} buffers, {} intervals, module \
+                     {}",
+                    primitives.plan.ops.len(),
+                    primitives.groups.len(),
+                    primitives.fused_groups().len(),
+                    primitives.buffers.len(),
+                    primitives.intervals.len(),
+                    short(&primitives.provenance.mlir_module_hash)
+                ),
+                Err(error) => error.to_string(),
+            },
+        });
+    } else if let Some(primitives) = &primitives {
+        // Standalone: the optimized module is not in this directory, so only the
+        // artifact's own consistency can be checked, and that is stated.
+        let own = primitives.validate_header();
+        checks.push(ChainCheck {
+            stage: "primitives",
+            check: "artifact self-consistency".to_string(),
+            ok: own.is_ok(),
+            detail: match own {
+                Ok(()) => format!(
+                    "no optimized module in the directory; checked format, schema and plan only \
+                     (module {} is trusted from the producer)",
+                    short(&primitives.provenance.mlir_module_hash)
+                ),
+                Err(error) => error.to_string(),
+            },
+        });
+    }
+
+    // The numerical contract the whole chain is built on: every requantization in
+    // the plan uses the documented half-away-from-zero fixed-point datapath, and the bound on
+    // how far the serialized M0/shift is from the manifest's f32 coefficients is
+    // recorded rather than assumed. The exactness baseline is the compiled
+    // fixed-point IR, never the training f32.
+    let mut rounds: Vec<(&str, crate::layout::Rounding, Option<u32>)> = Vec::new();
+    if let Some(plan) = &plan {
+        for step in &plan.steps {
+            if let Some(requant) = &step.requant {
+                rounds.push((
+                    step.op.as_str(),
+                    requant.rounding,
+                    requant.multiplier_error_ppm,
+                ));
+            }
+        }
+    } else if let Some(layout) = &layout {
+        for step in &layout.schedule {
+            if let Some(requant) = &step.requant {
+                rounds.push((
+                    step.op.as_str(),
+                    requant.rounding,
+                    requant.multiplier_error_ppm,
+                ));
+            }
+        }
+    }
+    if !rounds.is_empty() {
+        let off_contract: Vec<&str> = rounds
+            .iter()
+            .filter(|(_, rounding, _)| *rounding != crate::layout::Rounding::HalfAwayFromZero)
+            .map(|(op, _, _)| *op)
+            .collect();
+        let bounded = rounds.iter().filter(|(_, _, ppm)| ppm.is_some()).count();
+        let worst = rounds.iter().filter_map(|(_, _, ppm)| *ppm).max();
+        checks.push(ChainCheck {
+            stage: "layout",
+            check: "semantic contract".to_string(),
+            ok: off_contract.is_empty(),
+            detail: if off_contract.is_empty() {
+                format!(
+                    "half-away-from-zero fixed-point requantization on {} step(s); {bounded} \
+                     carry an \
+                     approximation bound, worst {} ppm against the manifest f32 (the exactness \
+                     baseline is the compiled fixed-point IR)",
+                    rounds.len(),
+                    match worst {
+                        Some(ppm) => ppm.to_string(),
+                        None => "no".to_string(),
+                    }
+                )
+            } else {
+                format!(
+                    "steps {:?} do not use the documented half-away-from-zero rounding, so the \
+                     plan is not \
+                     the datapath this compiler claims to emit",
+                    off_contract
+                )
+            },
+        });
     }
 
     if let (Some(layout), Some(plan)) = (&layout, &plan) {
@@ -571,6 +735,81 @@ pub fn verify_chain(dir: &StageDir) -> Result<Vec<ChainCheck>, ChainError> {
                     )
                 },
             });
+        }
+    }
+
+    if let Some(rtl) = &rtl {
+        if let Some(full) = &rtl.full_graph {
+            // The allocator may reuse words, so "no two slots overlap" is the wrong
+            // invariant; the right one is that slots whose *live ranges* overlap do
+            // not overlap in address. This is checked from the persisted artifact
+            // rather than trusted, because a sum-of-live-words allocation can hand
+            // two simultaneously live slots the same words.
+            let mut conflicts = Vec::new();
+            for (index, a) in full.slots.iter().enumerate() {
+                for b in full.slots.iter().skip(index + 1) {
+                    let both_live = a.live[0] <= b.live[1] && b.live[0] <= a.live[1];
+                    if !both_live {
+                        continue;
+                    }
+                    let disjoint =
+                        a.offset + a.elements <= b.offset || b.offset + b.elements <= a.offset;
+                    if !disjoint {
+                        conflicts.push(format!(
+                            "{} [{}, {}) and {} [{}, {}) are both live over steps {}-{} / {}-{}",
+                            a.name,
+                            a.offset,
+                            a.offset + a.elements,
+                            b.name,
+                            b.offset,
+                            b.offset + b.elements,
+                            a.live[0],
+                            a.live[1],
+                            b.live[0],
+                            b.live[1]
+                        ));
+                    }
+                }
+            }
+            checks.push(ChainCheck {
+                stage: "rtl",
+                check: "simultaneous address disjoint".to_string(),
+                ok: conflicts.is_empty(),
+                detail: if conflicts.is_empty() {
+                    format!(
+                        "{} arena slot(s) checked pairwise; no two simultaneously live slots share \
+                         an address",
+                        full.slots.len()
+                    )
+                } else {
+                    format!(
+                        "{} overlapping pair(s): {}",
+                        conflicts.len(),
+                        conflicts.join("; ")
+                    )
+                },
+            });
+            // The emitted high-water mark may be smaller than the plan's budget (it
+            // may reuse words) but never larger, or the plan under-budgets the
+            // structure that was built from it.
+            if let Some(plan) = &plan {
+                let budget = plan.engine.arena_words;
+                let high_water = full.arena_words;
+                checks.push(ChainCheck {
+                    stage: "rtl",
+                    check: "arena high-water within budget".to_string(),
+                    ok: budget == 0 || high_water <= budget,
+                    detail: if budget == 0 {
+                        format!("emitted {high_water} word(s); the plan declares no budget")
+                    } else {
+                        format!(
+                            "emitted {high_water} words against a plan budget of {budget} \
+                             (without reuse: {})",
+                            full.arena_words_without_reuse
+                        )
+                    },
+                });
+            }
         }
     }
 

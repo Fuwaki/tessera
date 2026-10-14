@@ -64,7 +64,7 @@
           "requant": {
             "m0": 65536,
             "shift": 18,
-            "rounding": "half_up",
+            "rounding": "half_away_from_zero",
             "saturate_lo": -128,
             "saturate_hi": 127
           },

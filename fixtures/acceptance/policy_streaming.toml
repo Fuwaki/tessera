@@ -1,0 +1,40 @@
+# Acceptance policy restricted to streaming/dedicated frame execution.
+#
+# The narrow v1 RTL envelope is defined for streaming engines (ADR-0003), so the
+# RTL acceptance run tries this policy before giving up on the plan shape.
+format = "tessera.policy"
+schema_version = 1
+operator_override = []
+
+[constraints]
+allow_cpu_layer_dispatch = false
+max_frame_cycles = 50000000
+# Exact against the compiled fixed-point contract, not the training f32
+require_bit_exact = true
+
+[fusion]
+allow = []
+forbid = ["fanout_value", "cross_ddr_boundary"]
+
+[hint]
+prefer_bram_over_ddr = false
+prefer_fusion = false
+prefer_shared_engines = false
+
+[memory]
+allow_ping_pong = true
+max_ping_pong_buffers = 2
+placements = ["line_buffer", "bram", "ddr"]
+
+[objective]
+primary = "minimize_cycles"
+secondary = ["minimize_ddr_bytes"]
+
+[search]
+execution_modes = ["streaming", "dedicated"]
+granularities = ["frame"]
+max_candidates = 200000
+seed = 20261015
+tile_heights = []
+tile_widths = []
+utilisation_percent = 85

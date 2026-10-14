@@ -15,13 +15,19 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
+use super::analysis::ModuleAnalysis;
 use super::quant::{ClampSpec, RequantSpec, RoundingMode};
+use crate::graph::GraphArtifact;
 
 /// Value of [`MlirArtifact::format`].
 pub const MLIR_ARTIFACT_FORMAT: &str = "tessera.mlir";
 
 /// Value of [`MlirArtifact::schema_version`].
-pub const MLIR_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+///
+/// Schema 2 adds the concrete input shape, the activation tensor table and the
+/// structured analysis of the optimized module; without them a planning-stage
+/// artifact cannot drive primitive lowering on its own.
+pub const MLIR_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 
 /// Default name of the emitted MLIR function.
 pub const DEFAULT_FUNCTION_NAME: &str = "tessera_graph";
@@ -60,6 +66,15 @@ pub enum ElementType {
     /// with the identical bit pattern, because `arith` accepts only signless
     /// integer types.
     I8,
+    /// `i16`: activation codes whose range is wider than one signed byte.
+    ///
+    /// An elementwise `add` requantizes and clamps only its *branch* operand and
+    /// leaves the sum unclamped (`fpga_st_train/src/intref.rs:257-268`), so the
+    /// point it writes holds `[-2*qmax, 2*qmax]` codes. They are carried in
+    /// `i16` — never narrowed to `i8`, which would wrap — and a convolution
+    /// reading such a point widens them explicitly. The exact interval is
+    /// recorded per tensor in [`TensorBinding::code_range`].
+    I16,
     /// `i32`: convolution accumulators, biases, quantized linear codes and
     /// fixed-point multipliers.
     I32,
@@ -72,6 +87,7 @@ impl ElementType {
     pub const fn mlir(self) -> &'static str {
         match self {
             ElementType::I8 => "i8",
+            ElementType::I16 => "i16",
             ElementType::I32 => "i32",
             ElementType::I64 => "i64",
         }
@@ -81,6 +97,7 @@ impl ElementType {
     pub const fn bits(self) -> u32 {
         match self {
             ElementType::I8 => 8,
+            ElementType::I16 => 16,
             ElementType::I32 => 32,
             ElementType::I64 => 64,
         }
@@ -89,6 +106,54 @@ impl ElementType {
     /// Width in bytes.
     pub const fn bytes(self) -> u64 {
         (self.bits() / 8) as u64
+    }
+}
+
+/// Inclusive interval of activation codes a tensor carries.
+///
+/// This is exact, not a container width: a point written by a convolution holds
+/// `[-qmax, qmax]` (or `[0, qmax]`, `[0, output_qmax]` for the saturated and
+/// unsigned regimes), while a point written by an `add` holds the sum of the two
+/// operand intervals. The planner and the RTL backend read it to size their
+/// datapath instead of assuming one signed byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeRange {
+    /// Smallest code the tensor can hold.
+    pub lo: i64,
+    /// Largest code the tensor can hold.
+    pub hi: i64,
+}
+
+impl CodeRange {
+    /// Interval of a saturated point.
+    pub const fn new(lo: i64, hi: i64) -> Self {
+        CodeRange { lo, hi }
+    }
+
+    /// Narrowest signed container width, in bits, that holds the interval.
+    ///
+    /// `[0, 255]` needs 9 signed bits even though the unsigned image head stores
+    /// it in an `i8` container, which is why this reports the signed width rather
+    /// than the element width.
+    pub fn signed_bits(&self) -> u32 {
+        let bound = self.lo.unsigned_abs().max(self.hi.unsigned_abs());
+        if bound == 0 {
+            return 1;
+        }
+        (u64::BITS - bound.leading_zeros()) + 1
+    }
+
+    /// Sum of two intervals, as an `add` of the two produces.
+    pub const fn sum(self, other: Self) -> Self {
+        CodeRange {
+            lo: self.lo + other.lo,
+            hi: self.hi + other.hi,
+        }
+    }
+
+    /// Whether every code fits in a signed byte.
+    pub const fn fits_i8(self) -> bool {
+        self.lo >= i8::MIN as i64 && self.hi <= i8::MAX as i64
     }
 }
 
@@ -223,6 +288,11 @@ pub struct TensorBinding {
     pub point: Option<u32>,
     /// Scale of the point, when known.
     pub scale: Option<f32>,
+    /// Exact interval of activation codes this value can hold, when the emitter
+    /// can bound it. See [`CodeRange`]: this is what tells a planner or a backend
+    /// that an `i16` value is a 9-bit code in a 16-bit transport, not a generic
+    /// 16-bit integer.
+    pub code_range: Option<CodeRange>,
 }
 
 /// Padding applied before a convolution.
@@ -282,6 +352,22 @@ pub enum OperatorKind {
     QuantizeU8,
 }
 
+impl OperatorKind {
+    /// Stable lowercase name. It is also the location-tag role of the operators
+    /// the emitter implements as a single structured operation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            OperatorKind::Conv2d => "conv2d",
+            OperatorKind::DepthwiseConv2d => "depthwise_conv2d",
+            OperatorKind::PointwiseConv2d => "pointwise_conv2d",
+            OperatorKind::Relu => "relu",
+            OperatorKind::Add => "add",
+            OperatorKind::UpsampleNearest2x => "upsample_nearest2x",
+            OperatorKind::QuantizeU8 => "quantize_u8",
+        }
+    }
+}
+
 /// Quantization contract of one emitted operator.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Quantization {
@@ -314,6 +400,37 @@ impl Quantization {
     }
 }
 
+/// Whether a layer's `bias_int32` vector contributes anything.
+///
+/// The bias codes themselves stay in the external weight blob; this records the
+/// one decision downstream stages need, so no stage has to guess it from
+/// lowered arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BiasContribution {
+    /// Every entry is zero, so the bias add is an exact identity and the
+    /// planner models the layer without a bias tensor.
+    Identity,
+    /// At least one entry is non-zero; the planner must carry a bias tensor.
+    NonZero,
+}
+
+impl BiasContribution {
+    /// Classify a `bias_int32` vector.
+    pub fn of(bias_int32: &[i32]) -> Self {
+        if bias_int32.iter().any(|value| *value != 0) {
+            BiasContribution::NonZero
+        } else {
+            BiasContribution::Identity
+        }
+    }
+
+    /// Whether the planner must carry a bias tensor for the layer.
+    pub const fn requires_tensor(self) -> bool {
+        matches!(self, BiasContribution::NonZero)
+    }
+}
+
 /// A convolution layer, pre-bound to MLIR values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LayerBinding {
@@ -330,6 +447,8 @@ pub struct LayerBinding {
     pub stride: [u32; 2],
     pub quantization: Quantization,
     pub filter: WeightReference,
+    /// Whether the layer's int32 bias is non-zero.
+    pub bias: BiasContribution,
 }
 
 /// One operator of the emitted graph, in execution order.
@@ -338,6 +457,13 @@ pub struct OperatorBinding {
     /// Position in the graph artifact's execution order.
     pub index: usize,
     pub kind: OperatorKind,
+    /// Stable identifier of this operator inside the emitted module.
+    ///
+    /// The emitter writes it into the MLIR location of every operation that
+    /// implements the operator (`loc("tessera:conv#0")`), so the optimized IR
+    /// still says which operator each loop nest came from. See
+    /// [`crate::mlir::analysis`].
+    pub tag: String,
     /// Owning layer for convolution and scheduling operators.
     pub layer: Option<String>,
     /// SSA names consumed, in operand order.
@@ -360,7 +486,11 @@ pub struct StructuralMetrics {
     pub linalg_ops: usize,
     pub affine_loops: usize,
     pub memref_allocs: usize,
-    /// Sum over all allocated `memref` shapes, in bytes.
+    /// Sum over the statically shaped `memref` allocations, in bytes.
+    ///
+    /// Allocations whose shape is not static contribute nothing and are counted
+    /// separately by [`crate::mlir::analysis::AnalysisCounts::dynamic_buffers`];
+    /// when there are any, this total is partial rather than measured.
     pub allocated_bytes: u64,
 }
 
@@ -495,8 +625,17 @@ pub struct MlirArtifact {
     pub stage: MlirStage,
     /// Textual MLIR.
     pub module: String,
+    /// Concrete input activation shape in `NHWC` order.
+    ///
+    /// The manifest contract carries no spatial extents, so the shape the module
+    /// was emitted for is recorded here: every later stage that has to propagate
+    /// shapes (primitive lowering, layout search) reads it instead of being told
+    /// again on the command line.
+    pub input_shape: Vec<u64>,
     /// Function arguments in declaration order.
     pub arguments: Vec<MlirArgument>,
+    /// Activation tensors the module names, in emission order.
+    pub tensors: Vec<TensorBinding>,
     /// Convolution layers.
     pub layers: Vec<LayerBinding>,
     /// Operators in execution order.
@@ -504,6 +643,9 @@ pub struct MlirArtifact {
     /// Graph output tensor.
     pub output: TensorBinding,
     pub metrics: ArtifactMetrics,
+    /// Structured analysis of [`MlirArtifact::module`], present for
+    /// planning-stage modules produced by [`crate::mlir::optimize`].
+    pub analysis: Option<ModuleAnalysis>,
     pub provenance: MlirProvenance,
 }
 
@@ -579,13 +721,360 @@ impl MlirArtifact {
                 ),
             });
         }
+        if self.input_shape.len() != 4 || self.input_shape.contains(&0) {
+            return Err(MlirError::Shape {
+                detail: format!(
+                    "artifact records input shape {:?}, which is not a non-empty NHWC shape",
+                    self.input_shape
+                ),
+            });
+        }
+        if self.module.is_empty() {
+            return Err(MlirError::IncompatibleArtifact {
+                detail: "artifact carries no module text".to_string(),
+            });
+        }
+        // The recorded hash is recomputed from the stored text rather than
+        // trusted: it is part of the artifact's identity, and a stale one would
+        // otherwise let edited text masquerade as the module an analysis
+        // describes.
+        let actual = content_hash(&self.module);
+        if self.provenance.module_hash != actual {
+            return Err(MlirError::Provenance {
+                detail: format!(
+                    "the artifact records module hash {}, but its stored text hashes to {actual}",
+                    self.provenance.module_hash
+                ),
+            });
+        }
         Ok(())
+    }
+
+    /// Re-check every hash and link this artifact promises.
+    ///
+    /// This is the check a later stage runs before trusting the artifact: the
+    /// recorded module hash must match the module text, the recorded source hash
+    /// must match the graph artifact it descends from, and a planning-stage
+    /// module must carry an analysis of exactly the stored text.
+    pub fn verify(
+        &self,
+        source: Option<&GraphArtifact>,
+    ) -> Result<Vec<ProvenanceCheck>, MlirError> {
+        self.validate_header()?;
+        let mut checks = Vec::new();
+        let module_hash = content_hash(&self.module);
+        checks.push(ProvenanceCheck {
+            check: "module hash".to_string(),
+            ok: module_hash == self.provenance.module_hash,
+            detail: format!(
+                "records {}, text hashes to {module_hash}",
+                self.provenance.module_hash
+            ),
+        });
+        if let Some(graph) = source {
+            let ok = self.provenance.source_content_hash == graph.provenance.manifest_sha256
+                && self.provenance.source_format == graph.format
+                && self.provenance.source_schema_version == graph.schema_version;
+            checks.push(ProvenanceCheck {
+                check: "descends from graph artifact".to_string(),
+                ok,
+                detail: format!(
+                    "mlir source {} schema {} hash {}, graph is {} schema {} hash {}",
+                    self.provenance.source_format,
+                    self.provenance.source_schema_version,
+                    self.provenance.source_content_hash,
+                    graph.format,
+                    graph.schema_version,
+                    graph.provenance.manifest_sha256
+                ),
+            });
+        }
+        match (&self.stage, &self.analysis) {
+            (MlirStage::Planning, recorded) => {
+                // A plan may only descend from a module the compiler's own
+                // pinned pipeline produced; a hand-edited pipeline claim is not
+                // evidence that optimized this text.
+                checks.push(self.verify_pipeline_provenance());
+                match recorded {
+                    Some(analysis) => {
+                        let ok = analysis.module_hash == self.provenance.module_hash
+                            && analysis.module_hash == module_hash;
+                        checks.push(ProvenanceCheck {
+                            check: "analysis describes the stored module".to_string(),
+                            ok,
+                            detail: format!(
+                                "analysis records {}, artifact records {}, text hashes to \
+                                 {module_hash}",
+                                analysis.module_hash, self.provenance.module_hash
+                            ),
+                        });
+                        // The link above is only a self-declared string. This
+                        // check recomputes the analysis from the stored text, so
+                        // a rewritten `tags`, `nests`, `buffers` or `operations`
+                        // map that keeps the recorded hash is caught instead of
+                        // trusted.
+                        checks.push(self.verify_rederived_analysis(analysis));
+                    }
+                    None => {
+                        checks.push(ProvenanceCheck {
+                            check: "analysis describes the stored module".to_string(),
+                            ok: false,
+                            detail: "planning-stage artifact carries no structured analysis"
+                                .to_string(),
+                        });
+                        checks.push(ProvenanceCheck {
+                            check: "analysis matches the re-derived structure".to_string(),
+                            ok: false,
+                            detail: "there is no structured analysis to re-derive against"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            (MlirStage::Tensor, _) => checks.push(ProvenanceCheck {
+                check: "analysis describes the stored module".to_string(),
+                ok: self.analysis.is_none(),
+                detail: "tensor-stage artifact is not analyzed".to_string(),
+            }),
+        }
+        Ok(checks)
+    }
+
+    /// Fail unless every provenance check holds.
+    pub fn check(&self, source: Option<&GraphArtifact>) -> Result<(), MlirError> {
+        for check in self.verify(source)? {
+            if !check.ok {
+                return Err(MlirError::Provenance {
+                    detail: format!("{}: {}", check.check, check.detail),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The compiler's supported planning provenance, or why it does not hold.
+    ///
+    /// The pipeline is pinned: one pass order is supported, and a planning-stage
+    /// artifact is only usable if it records that this build ran it. A
+    /// hand-written pipeline claim is not evidence, so it is rejected.
+    fn check_planning_provenance(&self) -> Result<(), String> {
+        if self.stage != MlirStage::Planning {
+            return Err(format!(
+                "the artifact is at stage {}; primitive lowering is driven by the planning-stage \
+                 optimized module",
+                self.stage
+            ));
+        }
+        let Some(melior) = &self.provenance.melior else {
+            return Err(
+                "the artifact records no Melior provenance, so it was not produced by the \
+                 compiler's pinned optimization pipeline"
+                    .to_string(),
+            );
+        };
+        if melior.melior_version != super::pipeline::PINNED_MELIOR_VERSION {
+            return Err(format!(
+                "the artifact records melior {}, but this build pins {}",
+                melior.melior_version,
+                super::pipeline::PINNED_MELIOR_VERSION
+            ));
+        }
+        let supported = super::pipeline::default_pipeline();
+        if melior.pipeline != supported {
+            return Err(format!(
+                "the artifact records a pipeline of {} passes, not the compiler's pinned pipeline \
+                 of {} passes",
+                melior.pipeline.len(),
+                supported.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The pinned-pipeline provenance as a check, for [`MlirArtifact::verify`].
+    fn verify_pipeline_provenance(&self) -> ProvenanceCheck {
+        match self.check_planning_provenance() {
+            Ok(()) => {
+                let melior = self
+                    .provenance
+                    .melior
+                    .as_ref()
+                    .expect("checked present just above");
+                ProvenanceCheck {
+                    check: "records the compiler's pinned pipeline".to_string(),
+                    ok: true,
+                    detail: format!(
+                        "melior {} ran {} passes",
+                        melior.melior_version,
+                        melior.pipeline.len()
+                    ),
+                }
+            }
+            Err(detail) => ProvenanceCheck {
+                check: "records the compiler's pinned pipeline".to_string(),
+                ok: false,
+                detail,
+            },
+        }
+    }
+
+    /// Re-derive the structured analysis from the stored module text.
+    ///
+    /// The analysis is recomputed by Melior from [`MlirArtifact::module`],
+    /// with the melior identity and pipeline the artifact records. It is the
+    /// authoritative description of the module; the embedded
+    /// [`MlirArtifact::analysis`] is only a cache of it and is never trusted
+    /// without being compared against this.
+    pub fn reanalyze(&self) -> Result<ModuleAnalysis, MlirError> {
+        let (version, pipeline) = match &self.provenance.melior {
+            Some(melior) => (melior.melior_version.clone(), melior.pipeline.clone()),
+            None => (
+                super::pipeline::PINNED_MELIOR_VERSION.to_string(),
+                Vec::new(),
+            ),
+        };
+        super::analysis::analyze(&self.module, &version, &pipeline)
+    }
+
+    /// Re-derive the embedded analysis and compare it, field by field.
+    ///
+    /// This is the check that binds a plan to its module: the recorded analysis
+    /// cannot satisfy it by editing metadata, because it is recomputed from the
+    /// module text. In a build without the `melior` feature the re-derivation is
+    /// impossible, and the check fails loudly rather than passing on metadata
+    /// that was never verified.
+    fn verify_rederived_analysis(&self, recorded: &ModuleAnalysis) -> ProvenanceCheck {
+        match self.reanalyze() {
+            Ok(derived) => {
+                let diffs = recorded.diff(&derived);
+                let ok = diffs.is_empty();
+                ProvenanceCheck {
+                    check: "analysis matches the re-derived structure".to_string(),
+                    ok,
+                    detail: if ok {
+                        format!(
+                            "re-derived from the stored text with Melior {} ({} operations, {} \
+                             loops, {} allocations, {} loop nests)",
+                            derived.melior_version,
+                            derived.counts.operations,
+                            derived.counts.loops,
+                            derived.counts.buffers,
+                            derived.nests.len()
+                        )
+                    } else {
+                        format!(
+                            "the recorded analysis does not describe the stored module: {}",
+                            diffs.join("; ")
+                        )
+                    },
+                }
+            }
+            Err(error) => ProvenanceCheck {
+                check: "analysis matches the re-derived structure".to_string(),
+                ok: false,
+                detail: format!(
+                    "the analysis cannot be re-derived ({error}); this build cannot verify an \
+                     embedded analysis, so it does not report one as verified"
+                ),
+            },
+        }
+    }
+
+    /// The structured analysis of a planning-stage module.
+    ///
+    /// Primitive lowering is driven by the optimized IR, so this re-derives the
+    /// analysis from the module text with Melior and refuses an artifact whose
+    /// recorded analysis disagrees with it — a rewritten `tags`, `nests`,
+    /// `buffers` or `operations` map is caught here even if it kept the recorded
+    /// `module_hash`. A module with dynamically shaped allocations is refused
+    /// too: planning needs shapes whose size is known.
+    ///
+    /// Without the `melior` feature the analysis cannot be re-derived at all, so
+    /// this errors instead of lowering from unverified metadata.
+    pub fn analyzed(&self) -> Result<&ModuleAnalysis, MlirError> {
+        let analysis = self.analysis.as_ref().ok_or_else(|| MlirError::Analysis {
+            detail: format!(
+                "artifact is at stage {} without a structured analysis; run the optimizer \
+                 (`tessera optimize`) before lowering to primitives",
+                self.stage
+            ),
+        })?;
+        let recorded = content_hash(&self.module);
+        if analysis.module_hash != recorded {
+            return Err(MlirError::Analysis {
+                detail: format!(
+                    "analysis records module hash {}, the artifact's text hashes to {recorded}",
+                    analysis.module_hash
+                ),
+            });
+        }
+        self.check_planning_provenance()
+            .map_err(|detail| MlirError::Analysis { detail })?;
+        let derived = self.reanalyze().map_err(|error| MlirError::Analysis {
+            detail: format!(
+                "the analysis of the stored module cannot be re-derived ({error}); refusing to \
+                 lower from analysis metadata that cannot be verified"
+            ),
+        })?;
+        let diffs = analysis.diff(&derived);
+        if !diffs.is_empty() {
+            return Err(MlirError::Analysis {
+                detail: format!(
+                    "the recorded analysis does not describe the stored module: {}",
+                    diffs.join("; ")
+                ),
+            });
+        }
+        if derived.counts.dynamic_buffers > 0 {
+            return Err(MlirError::Analysis {
+                detail: format!(
+                    "the optimized module allocates {} dynamically shaped buffer(s); planning \
+                     requires statically shaped allocations whose size is known, and refuses to \
+                     plan against a size it cannot determine",
+                    derived.counts.dynamic_buffers
+                ),
+            });
+        }
+        Ok(analysis)
+    }
+
+    /// The recorded input shape as `[N, H, W, C]`.
+    pub fn input_shape_nhwc(&self) -> Result<[u64; 4], MlirError> {
+        self.input_shape
+            .as_slice()
+            .try_into()
+            .map_err(|_| MlirError::Shape {
+                detail: format!("artifact input shape {:?} is not rank 4", self.input_shape),
+            })
+    }
+
+    /// Find an activation tensor by SSA name.
+    pub fn tensor(&self, ssa_name: &str) -> Option<&TensorBinding> {
+        self.tensors.iter().find(|t| t.ssa_name == ssa_name)
+    }
+
+    /// Find a function argument by role and, for filter arguments, by layer.
+    pub fn argument(&self, role: ArgumentRole, layer: Option<&str>) -> Option<&MlirArgument> {
+        self.arguments
+            .iter()
+            .find(|a| a.role == role && layer.is_none_or(|name| a.layer.as_deref() == Some(name)))
     }
 
     /// Look up a layer binding by its stable name.
     pub fn layer(&self, name: &str) -> Option<&LayerBinding> {
         self.layers.iter().find(|layer| layer.layer == name)
     }
+}
+
+/// Outcome of one provenance check on an MLIR artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenanceCheck {
+    /// What was checked.
+    pub check: String,
+    /// Whether it held.
+    pub ok: bool,
+    /// The evidence: both hashes, both stages, whatever the check compared.
+    pub detail: String,
 }
 
 /// Options that Graph IR cannot supply, because the manifest contract does not
@@ -674,6 +1163,10 @@ pub enum MlirError {
     Melior { detail: String },
     /// Artifact format or schema mismatch.
     IncompatibleArtifact { detail: String },
+    /// An artifact's recorded provenance does not match its contents.
+    Provenance { detail: String },
+    /// The structured analysis of a module is missing or inconsistent.
+    Analysis { detail: String },
     /// Artifact (de)serialization failure.
     Serialization { detail: String },
     /// Filesystem failure.
@@ -695,6 +1188,8 @@ impl fmt::Display for MlirError {
             }
             MlirError::Melior { detail } => write!(f, "Melior error: {detail}"),
             MlirError::IncompatibleArtifact { detail } => write!(f, "artifact mismatch: {detail}"),
+            MlirError::Provenance { detail } => write!(f, "provenance: {detail}"),
+            MlirError::Analysis { detail } => write!(f, "module analysis: {detail}"),
             MlirError::Serialization { detail } => write!(f, "serialization error: {detail}"),
             MlirError::Io { detail } => write!(f, "io error: {detail}"),
         }
@@ -801,7 +1296,9 @@ mod tests {
             function: DEFAULT_FUNCTION_NAME.to_string(),
             stage: MlirStage::Tensor,
             module: "module {}".to_string(),
+            input_shape: vec![1, 4, 4, 3],
             arguments: Vec::new(),
+            tensors: Vec::new(),
             layers: Vec::new(),
             operators: Vec::new(),
             output: TensorBinding {
@@ -810,6 +1307,7 @@ mod tests {
                 element: ElementType::I8,
                 point: None,
                 scale: None,
+                code_range: Some(CodeRange::new(0, 255)),
             },
             metrics: ArtifactMetrics {
                 operators: 0,
@@ -819,6 +1317,7 @@ mod tests {
                 requantizations: 0,
                 structural: None,
             },
+            analysis: None,
             provenance: MlirProvenance {
                 source_format: "tessera.graph".to_string(),
                 source_schema_version: 1,

@@ -1,0 +1,377 @@
+{
+  "format": "tessera.rtl_bundle",
+  "schema_version": 1,
+  "kernel_id": "tessera.full_graph.i8i8.v1",
+  "provenance": {
+    "compiler_version": "0.1.0",
+    "git_revision": "unknown",
+    "dirty": false,
+    "graph_schema_version": 0,
+    "plan_schema_version": 1,
+    "target": "ti60f225",
+    "target_revision": "fpga_src-2026-10-10",
+    "input_manifest_sha256": "6dfc6caf9b47c1e2c7aee16ca5aa73df1f4ef1d56452502a35dbf67f550c8acd",
+    "weights_sha256": "fnv1a64:8b4c4e371033fecc",
+    "planner_config_sha256": "ae5feaa8d6fb67c798f23ebf4dc1f9cd61e82db7a4fb2f3184b72784091ff534"
+  },
+  "plan": {
+    "plan_format": "tessera.execution_plan",
+    "plan_schema_version": 1,
+    "execution_mode": "shared_tile",
+    "granularity": "frame",
+    "engine": "shared_conv0",
+    "step_index": 0,
+    "step_count": 7,
+    "estimated_cycles": 10785,
+    "spatial_in": [
+      6,
+      6
+    ],
+    "spatial_out": [
+      12,
+      12
+    ]
+  },
+  "top_module": "tessera_full_graph_v1_tb",
+  "kernel_module": "tessera_full_graph_v1",
+  "layer": "quantize_u8_output",
+  "tile": {
+    "simd": 1,
+    "noc": 1,
+    "k": 1,
+    "fold": 1
+  },
+  "in_channels": 3,
+  "out_channels": 3,
+  "accumulator_width": 20,
+  "max_abs_accumulator": 438932,
+  "kernel_cycles_per_window": 9770,
+  "requantization": [],
+  "requant_multiplier_error_ppm": 8,
+  "config": {
+    "module_prefix": "tessera",
+    "emit_testbench": true,
+    "emit_memory_images": true,
+    "fixture_windows": 16,
+    "fixture_seed": 6840143426475589633
+  },
+  "files": [
+    {
+      "name": "expected.hex",
+      "kind": "memory_image",
+      "bytes": 21754,
+      "fnv1a64": "4da56e5fa32fb762"
+    },
+    {
+      "name": "reference_steps.txt",
+      "kind": "memory_image",
+      "bytes": 16764,
+      "fnv1a64": "72542aa46deebf5b"
+    },
+    {
+      "name": "run_verilator.sh",
+      "kind": "script",
+      "bytes": 452,
+      "fnv1a64": "d1c735310fa9af18"
+    },
+    {
+      "name": "stim_input.hex",
+      "kind": "memory_image",
+      "bytes": 771,
+      "fnv1a64": "9b0eac5c98f933a7"
+    },
+    {
+      "name": "tessera_full_graph_v1.sv",
+      "kind": "system_verilog",
+      "bytes": 47866,
+      "fnv1a64": "ff8f324590a71169"
+    },
+    {
+      "name": "tessera_full_graph_v1.weights.hex",
+      "kind": "memory_image",
+      "bytes": 651,
+      "fnv1a64": "6cb2d84c7c99b1f3"
+    },
+    {
+      "name": "tessera_full_graph_v1_tb.sv",
+      "kind": "testbench",
+      "bytes": 19205,
+      "fnv1a64": "4376d9df73163e79"
+    }
+  ],
+  "supported_operators": [
+    "full graph: dense conv2d (any kernel/stride, groups=1), depthwise conv2d, add with branch requantization, nearest 2x upsample, activation/requant, unsigned output quantization [tessera.full_graph.i8i8.v1]",
+    "requantization: fixed-point M0 in [0, 2^17) per output channel, uniform shift, round half away from zero, then saturation",
+    "borders: reflection (intref.rs::reflect_index, single step) and zero padding; activations: signed i8 with a 16-bit internal word for 9-bit residual sums; one shared 1-lane MAC array over a whole-frame arena"
+  ],
+  "supported_interface": [
+    "clk, rst (synchronous, active-high reset), start (frame start pulse), done (held until the next start)",
+    "in_data [7:0] signed int8 graph input codes, one code per beat, in_valid/in_ready",
+    "out_data [7:0] unsigned image codes, one code per beat, out_valid/out_ready; the frame's 432 output codes are streamed in channel-major order",
+    "dbg_en/dbg_addr[11-1:0]/dbg_data read the 1404x16-bit activation arena through the engine's single read port, serviced only while the FSM is idle or held (verification port, no second read port)",
+    "dbg_hold_en/dbg_cont/dbg_held: verification single-step. With dbg_hold_en low the FSM runs its schedule unchanged; with it high the FSM holds after the input load and after every step (dbg_held high) until dbg_cont is pulsed, so the testbench can read each step's codes through the shared debug port before the arena reuses them",
+    "testbench plusargs: +STIM=<path> +EXPECTED=<path> +TRACE=<path> +NOCHECK"
+  ],
+  "unsupported": [
+    "grouped convolution other than dense (groups=1) and depthwise (groups=in_channels)",
+    "any fold other than the shared engine's single lane (simd = pe = tap_parallel = 1, 1 multiplier)",
+    "row/tile scheduling granularity: the emitted engine makes one whole-frame pass per step",
+    "asymmetric quantization (non-zero activation or weight zero-points)",
+    "rounding other than half away from zero",
+    "saturation bounds outside signed 16 bits",
+    "activation element types other than i8/u8",
+    "reflection padding that needs more than a single reflection step",
+    "a tensor the plan does not budget in its activation-RAM region, or an arena larger than that region",
+    "a plan whose steps do not correspond one-to-one with the graph's lowered operators"
+  ],
+  "reuse_candidates": [
+    "nngen/examples/st_stream/rtl/sts_lib.v: sts_rq (bit-identical fx requantization)",
+    "nngen/examples/st_stream/rtl/sts_mvau (streaming SIMD/PE folding MAC array; the emitted engine is the same shared-array idea with one lane)",
+    "nngen/examples/st_stream/rtl/sts_rom (weight ROM with $readmemh initialization)"
+  ],
+  "reproduce": [
+    "emit: tessera::rtl::full::lower_full_graph -> tessera_full_graph_v1.sv + tessera_full_graph_v1_tb.sv + rtl_bundle.json",
+    "simulate: verilator --binary --timing -Wno-fatal --top-module tessera_full_graph_v1_tb -o tessera_full_graph_v1_tb_sim tessera_full_graph_v1.sv tessera_full_graph_v1_tb.sv && ./obj_dir/tessera_full_graph_v1_tb_sim",
+    "verify: the testbench prints TESSA_RTL_PASS with mismatches=0"
+  ],
+  "bundle_digest": "dfa82ce3e4ea3012",
+  "full_graph": {
+    "input": {
+      "c": 3,
+      "h": 6,
+      "w": 6
+    },
+    "output": {
+      "c": 3,
+      "h": 12,
+      "w": 12
+    },
+    "arena_words": 1404,
+    "arena_words_without_reuse": 2124,
+    "word_width": 16,
+    "accumulator_width": 20,
+    "accumulator_bound": 438932,
+    "product_width": 39,
+    "mac_lanes": 1,
+    "total_macs": 7488,
+    "cycles_unstalled": 9770,
+    "frame": {
+      "load_beats": 108,
+      "step_beats": 8798,
+      "drain_beats": 864,
+      "total_beats": 9770
+    },
+    "plan_cycles": 10785,
+    "steps": [
+      {
+        "index": 0,
+        "op": "stem",
+        "kind": "Conv2d",
+        "mac_lanes": 1,
+        "macs": 3888,
+        "read_beats": 3888,
+        "mac_beats": 3888,
+        "epilogue_beats": 144,
+        "store_beats": 144,
+        "pipeline_beats": 2,
+        "generated_cycles": 3890,
+        "plan_estimated_cycles": 4639
+      },
+      {
+        "index": 1,
+        "op": "dw",
+        "kind": "DepthwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 1296,
+        "read_beats": 1296,
+        "mac_beats": 1296,
+        "epilogue_beats": 144,
+        "store_beats": 144,
+        "pipeline_beats": 2,
+        "generated_cycles": 1298,
+        "plan_estimated_cycles": 1589
+      },
+      {
+        "index": 2,
+        "op": "mid",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 576,
+        "read_beats": 576,
+        "mac_beats": 576,
+        "epilogue_beats": 144,
+        "store_beats": 144,
+        "pipeline_beats": 2,
+        "generated_cycles": 578,
+        "plan_estimated_cycles": 742
+      },
+      {
+        "index": 3,
+        "op": "add.3",
+        "kind": "Add",
+        "mac_lanes": 0,
+        "macs": 0,
+        "read_beats": 288,
+        "mac_beats": 0,
+        "epilogue_beats": 0,
+        "store_beats": 144,
+        "pipeline_beats": 2,
+        "generated_cycles": 290,
+        "plan_estimated_cycles": 403
+      },
+      {
+        "index": 4,
+        "op": "upsample_nearest2x.3",
+        "kind": "NearestUpsample2x",
+        "mac_lanes": 0,
+        "macs": 0,
+        "read_beats": 576,
+        "mac_beats": 0,
+        "epilogue_beats": 0,
+        "store_beats": 576,
+        "pipeline_beats": 2,
+        "generated_cycles": 578,
+        "plan_estimated_cycles": 742
+      },
+      {
+        "index": 5,
+        "op": "head",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 1728,
+        "read_beats": 1728,
+        "mac_beats": 1728,
+        "epilogue_beats": 432,
+        "store_beats": 432,
+        "pipeline_beats": 2,
+        "generated_cycles": 1730,
+        "plan_estimated_cycles": 2097
+      },
+      {
+        "index": 6,
+        "op": "quantize_u8_output",
+        "kind": "QuantizeOutput",
+        "mac_lanes": 0,
+        "macs": 0,
+        "read_beats": 432,
+        "mac_beats": 0,
+        "epilogue_beats": 0,
+        "store_beats": 432,
+        "pipeline_beats": 2,
+        "generated_cycles": 434,
+        "plan_estimated_cycles": 573
+      }
+    ],
+    "slots": [
+      {
+        "name": "p0.v0",
+        "offset": 0,
+        "elements": 108,
+        "bytes": 216,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          0,
+          0
+        ]
+      },
+      {
+        "name": "p1.v0",
+        "offset": 108,
+        "elements": 144,
+        "bytes": 288,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          0,
+          3
+        ]
+      },
+      {
+        "name": "p2.v0",
+        "offset": 252,
+        "elements": 144,
+        "bytes": 288,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          1,
+          2
+        ]
+      },
+      {
+        "name": "p3.v0",
+        "offset": 396,
+        "elements": 144,
+        "bytes": 288,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          2,
+          3
+        ]
+      },
+      {
+        "name": "p3.v1",
+        "offset": 252,
+        "elements": 144,
+        "bytes": 288,
+        "domain": "i9",
+        "max_abs": 254,
+        "live": [
+          3,
+          4
+        ]
+      },
+      {
+        "name": "p3.v2",
+        "offset": 396,
+        "elements": 576,
+        "bytes": 1152,
+        "domain": "i9",
+        "max_abs": 254,
+        "live": [
+          4,
+          5
+        ]
+      },
+      {
+        "name": "image.v0",
+        "offset": 972,
+        "elements": 432,
+        "bytes": 864,
+        "domain": "u8",
+        "max_abs": 255,
+        "live": [
+          5,
+          6
+        ]
+      },
+      {
+        "name": "output.u8",
+        "offset": 0,
+        "elements": 432,
+        "bytes": 864,
+        "domain": "u8",
+        "max_abs": 255,
+        "live": [
+          6,
+          6
+        ]
+      }
+    ],
+    "semantic_notes": [
+      "graph lowering notes: layer stem: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer dw: int32 bias is all zero and was dropped (exact identity); layer dw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer mid: int32 bias is all zero and was dropped (exact identity); layer mid: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; add on point 3: branch requant factor 0.014/0.03 serialized to M0=122334 shift=18 (worst relative error 1.022e-6); layer head: int32 bias is all zero and was dropped (exact identity)",
+      "activation arena words are 16-bit because the residual `add` is unclamped (intref.rs:257-268), so codes leave the i8 domain after a residual sum",
+      "one shared single-lane engine: exactly one 16x8 MAC multiplier and one 20x17 requantization multiplier serve every step of the schedule (DSP count does not grow with the layer count); steps differ only in the muxed address/control they present",
+      "arena allocation reuses words by tensor lifetime: 1404 words peak against 2124 words if every slot were kept live; the plan's activation-RAM region covers it",
+      "requantization is the fixed-point `(acc*M0 + round) >> shift` datapath; the manifest's f32 coefficients are reported separately and are NOT reproduced bit for bit (bounded by Requant::multiplier_error_ppm)",
+      "timed structure: every read is registered (one cycle); the MAC stage consumes the previous address stage, so a product lands every cycle and a store drains one cycle after its element; the epilogue multiplier sits between registers. The recorded frame beats are the unstalled schedule and are measured by the generated testbench; input gaps and output backpressure are counted separately and are never folded in",
+      "provenance: weights are resolved through the supplied WeightResolver for `weights:{layer}` tensors and the embedded bytes digest to fnv1a64:8b4c4e371033fecc; `bias_int32` comes from the graph artifact's layer and the plan's bias-tensor presence is cross-checked against it; the plan's declared weights digest was None",
+      "physical mapping: one shared activation arena of 1404 x 16-bit words with lifetime reuse (2124 words if every tensor stayed live), 1 MAC multiplier, one requantization multiplier, and 9770 unstalled beats per frame; graph-internal activations never leave the chip (no internal DMA and no DDR port), so the plan's DDR figures for internal buffers are not realized by this structure, only the graph input and output cross the module boundary",
+      "generated unstalled beats 9770 = load 108 + steps 8798 + drain 864; plan estimate 10785 (plan/estimate = 1.104); the plan number is an estimate and is never presented as measured",
+      "plan arena budget: engine.arena_words = 1404 vs emitted 1404 words (same lifetime allocation, so the plan charges exactly the emitted high-water mark)",
+      "manifest f32 vs emitted fixed point: 5 step(s) differ, worst per-step code distance 12 (documented M0/shift approximation, not a bit-exact claim)"
+    ]
+  }
+}

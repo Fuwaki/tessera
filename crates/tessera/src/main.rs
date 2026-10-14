@@ -17,13 +17,28 @@ use std::path::{Path, PathBuf};
 
 use tessera::graph::GraphArtifact;
 use tessera::layout::LayoutArtifact;
-use tessera::lower::{InputShape, LowerReport, lower_graph};
+use tessera::lower::{InputShape, lower_graph};
 use tessera::mlir::{self, MlirArtifact, MlirOptions, SourceGraph};
 use tessera::planner::{self, Policy, ProvenanceInput};
+use tessera::primitive;
 use tessera::rtl::{self, RtlConfig, SimulationOutcome, SystemVerilogBackend};
 use tessera::stages::{self, ArtifactKind, ChainCheck, StageDir};
 use tessera::target::Ti60Target;
 use tessera::weights::{GraphWeightResolver, NamedBlobResolver};
+
+/// Identifier of the numerical contract this compiler implements.
+///
+/// The generated datapath computes `(acc * M0 + round) >> shift` with a 17-bit
+/// multiplier and a rounding offset of `2^(shift-1)` for non-negative products and
+/// `2^(shift-1) - 1` for negative ones, i.e. **round half away from zero**. That is
+/// not the same rule as "half up" (toward positive infinity): the two disagree
+/// exactly at negative ties, where this datapath rounds away from zero. What it
+/// does *not* reproduce is the
+/// training `f32` requantization factor: that is approximated by the serialized
+/// `M0`/`shift`, and every step records the worst-case relative error it incurred
+/// (`Requant::multiplier_error_ppm`). Reports say so instead of calling the result
+/// bit-exact, because the two claims are different.
+const SEMANTIC_CONTRACT: &str = "tessera.fixed_point.requant.half_away_from_zero.v1";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -98,11 +113,18 @@ struct OptimizeArgs {
 #[derive(Debug, Args)]
 struct SolveArgs {
     /// Persisted graph artifact to lower and solve for.
-    #[arg(long, value_name = "FILE", conflicts_with = "primitive")]
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["primitive", "mlir"])]
     graph: Option<PathBuf>,
-    /// Lowered primitive graph (`PlanInput` JSON) to solve directly.
-    #[arg(long, value_name = "FILE", conflicts_with = "graph")]
+    /// Lowered primitive graph (`PlanInput` JSON, or a `tessera.primitive` artifact).
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["graph", "mlir"])]
     primitive: Option<PathBuf>,
+    /// Optimized MLIR artifact to lower and solve for (`optimized.json`).
+    ///
+    /// The plan is derived from the optimized module's own operations, loop
+    /// nests and materialized buffers, so this path cannot re-derive a plan from
+    /// the graph behind MLIR's back.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["graph", "primitive"])]
+    mlir: Option<PathBuf>,
     /// Target description (TOML).
     #[arg(long, value_name = "FILE")]
     target: PathBuf,
@@ -396,46 +418,131 @@ fn cmd_solve(args: SolveArgs) -> Result<std::process::ExitCode> {
     // Always materialize the input artifact into the stage directory, and
     // record the hash of the *staged copy* so `verify` can re-check it later
     // without the original path.
-    let (input, report, source_label, source_file) = match (&args.graph, &args.primitive) {
-        (Some(graph), None) => {
-            let artifact = load_graph_file(graph)?;
-            let staged = materialize(&dir, graph, stages::GRAPH_FILE)?;
-            copy_weight_blob(
-                &dir,
-                graph.parent().unwrap_or_else(|| Path::new(".")),
-                artifact.provenance().weight_file.as_str(),
-            )?;
-            let shape = resolve_input_shape(&dir, args.input_shape.as_deref(), &staged)?;
-            write_input_shape(&dir, shape)?;
-            let (plan, report) =
-                lower_graph(artifact.graph(), shape).map_err(|error| anyhow!("{error}"))?;
-            (
-                plan,
-                report,
-                graph.display().to_string(),
-                stages::GRAPH_FILE,
-            )
-        }
-        (None, Some(primitive)) => {
-            let text = std::fs::read_to_string(primitive)
-                .with_context(|| format!("reading {}", primitive.display()))?;
-            let plan = stages::parse_primitive(&text).map_err(|error| anyhow!("{error}"))?;
-            let canonical =
-                serde_json::to_string_pretty(&plan).context("serializing the primitive graph")?;
-            dir.write_text(stages::PRIMITIVE_FILE, &canonical)
-                .with_context(|| {
-                    format!("writing {}", dir.path(stages::PRIMITIVE_FILE).display())
+    let (input, notes, primitives_json, source_label, source_file) =
+        match (&args.graph, &args.primitive, &args.mlir) {
+            (Some(graph), None, None) => {
+                let artifact = load_graph_file(graph)?;
+                // Resolve the resolution from the directory the graph lives in (or
+                // from this stage directory) *before* staging a copy: the copy lands
+                // in the output directory, which need not hold a recorded shape.
+                let shape = resolve_input_shape(&dir, args.input_shape.as_deref(), graph)?;
+                let staged = materialize(&dir, graph, stages::GRAPH_FILE)?;
+                copy_weight_blob(
+                    &dir,
+                    graph.parent().unwrap_or_else(|| Path::new(".")),
+                    artifact.provenance().weight_file.as_str(),
+                )?;
+                write_input_shape(&dir, shape)?;
+                let (plan, report) =
+                    lower_graph(artifact.graph(), shape).map_err(|error| anyhow!("{error}"))?;
+                (
+                    plan,
+                    report.notes,
+                    None,
+                    graph.display().to_string(),
+                    stages::GRAPH_FILE,
+                )
+            }
+            (None, Some(primitive), None) => {
+                let text = std::fs::read_to_string(primitive)
+                    .with_context(|| format!("reading {}", primitive.display()))?;
+                let plan = stages::parse_primitive(&text).map_err(|error| anyhow!("{error}"))?;
+                // A full `tessera.primitive` artifact is preserved verbatim, evidence and
+                // all, so `verify` can link it to the module it descends from; a bare
+                // `PlanInput` is re-serialized canonically.
+                let is_artifact =
+                    stages::detect_kind(&text) == Some(ArtifactKind::PrimitiveArtifact);
+                if is_artifact {
+                    let staged = materialize(&dir, primitive, stages::PRIMITIVES_FILE)?;
+                    let artifact = primitive::PrimitiveArtifact::from_json(&text)
+                        .map_err(|error| anyhow!("{error}"))?;
+                    println!(
+                        "  primitive artifact: {} ({} operators, {} fusion groups ({} fused), {} \
+                     buffers) staged verbatim",
+                        staged.display(),
+                        artifact.plan.ops.len(),
+                        artifact.groups.len(),
+                        artifact.fused_groups().len(),
+                        artifact.buffers.len()
+                    );
+                }
+                let canonical = serde_json::to_string_pretty(&plan)
+                    .context("serializing the primitive graph")?;
+                dir.write_text(stages::PRIMITIVE_FILE, &canonical)
+                    .with_context(|| {
+                        format!("writing {}", dir.path(stages::PRIMITIVE_FILE).display())
+                    })?;
+                (
+                    plan,
+                    Vec::new(),
+                    None,
+                    primitive.display().to_string(),
+                    stages::PRIMITIVE_FILE,
+                )
+            }
+            (None, None, Some(mlir)) => {
+                let artifact = MlirArtifact::load(mlir)
+                    .with_context(|| format!("loading MLIR artifact {}", mlir.display()))?;
+                let staged = materialize(&dir, mlir, stages::OPTIMIZED_FILE)?;
+                // Integrity before consumption: the module text is re-hashed, the staged
+                // graph is compared, and the embedded analysis is re-derived and compared
+                // field by field. A build without the `melior` feature cannot re-derive it,
+                // so the check fails there instead of trusting metadata it cannot confirm.
+                artifact
+                    .check(None)
+                    .map_err(|error| anyhow!("MLIR artifact integrity: {error}"))?;
+                println!(
+                    "  analysis integrity: {}",
+                    if mlir::analysis_verification_available() {
+                        "re-derived from the module text and matched field by field"
+                    } else {
+                        "checked by the artifact (this build can re-derive it)"
+                    }
+                );
+                let lowered = primitive::lower(&artifact)
+                    .map_err(|error| anyhow!("lowering the optimized module: {error}"))?;
+                let input_tensor = lowered
+                    .plan
+                    .tensor(lowered.plan.inputs[0])
+                    .ok_or_else(|| anyhow!("the lowered plan has no input tensor"))?;
+                write_input_shape(&dir, {
+                    InputShape::new(
+                        input_tensor.shape.c,
+                        input_tensor.shape.h,
+                        input_tensor.shape.w,
+                    )
+                    .map_err(|error| anyhow!("{error}"))?
                 })?;
-            (
-                plan,
-                LowerReport::default(),
-                primitive.display().to_string(),
-                stages::PRIMITIVE_FILE,
-            )
-        }
-        (None, None) => bail!("select an input with --graph <graph.tgraph> or --primitive <file>"),
-        (Some(_), Some(_)) => unreachable!("clap rejects --graph with --primitive"),
-    };
+                let primitives = lowered.to_json().map_err(|error| anyhow!("{error}"))?;
+                println!(
+                    "lowered {} into {} tensors / {} operators, {} fusion groups ({} fused), {} \
+                 buffers ({} allocated, {} dynamically shaped)",
+                    staged.display(),
+                    lowered.plan.tensors.len(),
+                    lowered.plan.ops.len(),
+                    lowered.groups.len(),
+                    lowered.fused_groups().len(),
+                    lowered.buffers.len(),
+                    match lowered.allocated_bytes() {
+                        Some(bytes) => format!("{bytes} bytes"),
+                        None => "unknown".to_string(),
+                    },
+                    lowered.dynamic_buffers()
+                );
+                (
+                    lowered.plan,
+                    lowered.notes.clone(),
+                    Some(primitives),
+                    mlir.display().to_string(),
+                    stages::OPTIMIZED_FILE,
+                )
+            }
+            (None, None, None) => bail!(
+                "select an input with --graph <graph.tgraph>, --mlir <optimized.json> or \
+             --primitive <file>"
+            ),
+            _ => unreachable!("clap rejects more than one solve input"),
+        };
     let source_hash = dir.sha256(source_file)?;
 
     let primitive_path = dir.path(stages::PRIMITIVE_FILE);
@@ -444,6 +551,12 @@ fn cmd_solve(args: SolveArgs) -> Result<std::process::ExitCode> {
             .context("serializing the lowered primitive graph")?;
         dir.write_text(stages::PRIMITIVE_FILE, &primitive_json)
             .with_context(|| format!("writing {}", primitive_path.display()))?;
+    }
+    if let Some(primitives) = &primitives_json {
+        // The evidence-carrying artifact (`tessera.primitive`) is written next to
+        // the planner's own input so `verify` can link it to the optimized module.
+        dir.write_text(stages::PRIMITIVES_FILE, primitives)
+            .with_context(|| format!("writing {}", dir.path(stages::PRIMITIVES_FILE).display()))?;
     }
 
     dir.copy_in(&args.target, stages::TARGET_FILE)
@@ -458,7 +571,7 @@ fn cmd_solve(args: SolveArgs) -> Result<std::process::ExitCode> {
     let policy = Policy::from_toml_file(dir.path(stages::POLICY_FILE))
         .map_err(|error| anyhow!("loading policy: {error}"))?;
 
-    for note in &report.notes {
+    for note in &notes {
         println!("  lower: {note}");
     }
     println!(
@@ -481,6 +594,65 @@ fn cmd_solve(args: SolveArgs) -> Result<std::process::ExitCode> {
     artifact
         .save(&layout_path)
         .with_context(|| format!("writing {}", layout_path.display()))?;
+
+    let certainty = artifact.certainty;
+    let search = &artifact.search;
+    println!(
+        "  search: certainty {certainty:?}, {} candidates explored, {} expansions, \
+         {} truncated candidate(s) of a {}-expansion share, truncated {}",
+        search.explored,
+        search.expanded_nodes,
+        search.truncated_candidates,
+        search.per_candidate_budget,
+        search.truncated
+    );
+
+    // What the compiler's correctness claim actually is. The generated datapath is
+    // exact against the *compiled* fixed-point contract; the training `f32`
+    // requantization factors are approximated by the serialized 17-bit `M0` and the
+    // shift, and the worst-case relative error of that approximation is recorded
+    // per step rather than hidden behind the word "exact".
+    let mut worst_ppm: Option<u32> = None;
+    let mut off_contract = Vec::new();
+    for step in &artifact.schedule {
+        if let Some(requant) = &step.requant {
+            if requant.rounding != tessera::layout::Rounding::HalfAwayFromZero {
+                off_contract.push(step.op.clone());
+            }
+            if let Some(ppm) = requant.multiplier_error_ppm {
+                worst_ppm = Some(worst_ppm.map_or(ppm, |current: u32| current.max(ppm)));
+            }
+        }
+    }
+    if off_contract.is_empty() {
+        println!(
+            "  semantic contract: {} (half-away-from-zero requantization, {}-bit multiplier); \
+             the exactness baseline is the compiled fixed-point IR, not the training f32",
+            SEMANTIC_CONTRACT,
+            rtl::MULTIPLIER_BITS
+        );
+    }
+    match worst_ppm {
+        Some(ppm) => println!(
+            "  requantization approximation: worst recorded {ppm} ppm relative to the manifest's \
+             f32 coefficients ({} step(s) carry a bound)",
+            artifact
+                .schedule
+                .iter()
+                .filter(|step| step
+                    .requant
+                    .as_ref()
+                    .is_some_and(|r| r.multiplier_error_ppm.is_some()))
+                .count()
+        ),
+        None => println!(
+            "  requantization approximation: no step recorded a bound, so the manifest f32 \
+             divergence is unreported for this plan"
+        ),
+    }
+    for op in &off_contract {
+        println!("  warning: step {op} does not use the documented half-away-from-zero rounding");
+    }
 
     match artifact.status {
         tessera::layout::PlanStatus::Feasible => {
@@ -533,7 +705,29 @@ fn cmd_solve(args: SolveArgs) -> Result<std::process::ExitCode> {
             ok()
         }
         tessera::layout::PlanStatus::Infeasible => {
-            println!("layout: INFEASIBLE, no candidate satisfied the target and policy");
+            // A truncated search has not proved that nothing is feasible, so it
+            // must not be reported as a property of the target.
+            let conclusive = certainty == tessera::layout::PlanCertainty::ProvenInfeasible;
+            println!(
+                "layout: {}, no candidate satisfied the target and policy",
+                if conclusive {
+                    "INFEASIBLE"
+                } else {
+                    "INCONCLUSIVE"
+                }
+            );
+            for (mode, summary) in &artifact.rejections.by_mode {
+                println!(
+                    "  mode {mode}: {} candidate(s), {} feasible",
+                    summary.candidates, summary.feasible
+                );
+                for (category, count) in &summary.counts {
+                    println!("    rejected {category}: {count}");
+                }
+                if let Some(reason) = &summary.first_reason {
+                    println!("    first reason: {reason}");
+                }
+            }
             for (category, count) in &artifact.rejections.counts {
                 println!("  rejected {category}: {count}");
             }
@@ -546,10 +740,22 @@ fn cmd_solve(args: SolveArgs) -> Result<std::process::ExitCode> {
                 );
             }
             println!("  layout: {}", layout_path.display());
+            if conclusive {
+                bail!(
+                    "no feasible layout under {} and {} (the search covered the declared space); \
+                     the rejected-candidate summary is in {}",
+                    dir.path(stages::TARGET_FILE).display(),
+                    dir.path(stages::POLICY_FILE).display(),
+                    layout_path.display()
+                );
+            }
             bail!(
-                "no feasible layout under {} and {}; the rejected-candidate summary is in {}",
+                "layout INCONCLUSIVE under {} and {}: the candidate budget stopped the search \
+                 ({} truncated candidate(s)) without proving infeasibility; the rejected-candidate \
+                 summary is in {}",
                 dir.path(stages::TARGET_FILE).display(),
                 dir.path(stages::POLICY_FILE).display(),
+                search.truncated_candidates,
                 layout_path.display()
             );
         }
@@ -679,6 +885,47 @@ fn cmd_inspect(args: InspectArgs) -> Result<std::process::ExitCode> {
                 println!("    {}: {:?}", op.name, op.kind);
             }
         }
+        ArtifactKind::PrimitiveArtifact => {
+            let artifact = primitive::PrimitiveArtifact::from_json(&text)
+                .map_err(|error| anyhow!("{error}"))?;
+            println!("  graph: {}", artifact.plan.name);
+            println!(
+                "  tensors: {}, operators: {}, inputs: {:?}, outputs: {:?}",
+                artifact.plan.tensors.len(),
+                artifact.plan.ops.len(),
+                artifact.plan.inputs,
+                artifact.plan.outputs
+            );
+            let allocated = match artifact.allocated_bytes() {
+                Some(bytes) => format!("{bytes} bytes"),
+                None => format!(
+                    "unknown over {} dynamic allocation(s)",
+                    artifact.dynamic_buffers()
+                ),
+            };
+            println!(
+                "  loop groups: {} ({} fused), buffers: {} ({allocated}), intervals: {}",
+                artifact.groups.len(),
+                artifact.fused_groups().len(),
+                artifact.buffers.len(),
+                artifact.intervals.len()
+            );
+            println!(
+                "  source module hash: {} (melior {})",
+                artifact.provenance.mlir_module_hash,
+                artifact
+                    .provenance
+                    .melior_version
+                    .as_deref()
+                    .unwrap_or("not recorded")
+            );
+            for op in &artifact.plan.ops {
+                println!("    {}: {:?}", op.name, op.kind);
+            }
+            for note in &artifact.notes {
+                println!("  note: {note}");
+            }
+        }
         ArtifactKind::Layout => {
             let artifact =
                 LayoutArtifact::load(&args.artifact).map_err(|error| anyhow!("{error}"))?;
@@ -698,8 +945,30 @@ fn cmd_inspect(args: InspectArgs) -> Result<std::process::ExitCode> {
             println!("  target sha256: {}", artifact.provenance.target_sha256);
             println!("  policy sha256: {}", artifact.provenance.policy_sha256);
             println!(
-                "  search: {} explored, {} expanded, truncated {}",
-                artifact.search.explored, artifact.search.expanded_nodes, artifact.search.truncated
+                "  search: {} explored, {} expanded, {} truncated candidate(s) of a {}-expansion \
+                 share, truncated {}",
+                artifact.search.explored,
+                artifact.search.expanded_nodes,
+                artifact.search.truncated_candidates,
+                artifact.search.per_candidate_budget,
+                artifact.search.truncated
+            );
+            println!("  certainty: {:?}", artifact.certainty);
+            // The exactness baseline is the compiled fixed-point contract; the
+            // training f32 coefficients are approximated by M0/shift, and the
+            // recorded bound is what a reader should judge that approximation by.
+            let worst = artifact
+                .schedule
+                .iter()
+                .filter_map(|step| step.requant.as_ref()?.multiplier_error_ppm)
+                .max();
+            println!(
+                "  semantic contract: {SEMANTIC_CONTRACT}; exactness baseline is the compiled \
+                 fixed-point IR, not the training f32{}",
+                match worst {
+                    Some(ppm) => format!(", worst recorded requantization error {ppm} ppm"),
+                    None => ", no requantization error bound recorded".to_string(),
+                }
             );
             if let Some(resources) = artifact.resources {
                 println!(
@@ -811,27 +1080,49 @@ fn emit_bundle(
         .map_err(|error| anyhow!("projecting the execution plan: {error}"))?;
     write_plan(&dir.path(stages::PLAN_FILE), &plan)?;
 
-    let bundle = match (graph, weights) {
-        (Some(graph_path), _) => {
-            let artifact = load_graph_file(graph_path)?;
-            let base = graph_path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            let resolver =
-                GraphWeightResolver::load(&artifact, base).map_err(|error| anyhow!("{error}"))?;
-            SystemVerilogBackend
-                .lower_execution_plan(&plan, &resolver, config)
-                .map_err(|error| anyhow!("{error}"))?
+    // Dispatch by plan shape, never by preference: a single pointwise step goes
+    // to the single-kernel backend unchanged; anything else needs the full-graph
+    // backend *and* the graph artifact, because bias comes from the model and
+    // cannot be recovered from weight bytes alone.
+    let bundle = if plan.steps.len() > 1 {
+        match graph {
+            Some(graph_path) => {
+                let artifact = load_graph_file(graph_path)?;
+                let resolver = graph_resolver(&artifact, graph_path)?;
+                println!(
+                    "  full-graph backend: {} steps, one static-schedule engine over an \
+                     activation arena",
+                    plan.steps.len()
+                );
+                SystemVerilogBackend
+                    .lower_full_graph(&plan, artifact.graph(), &resolver, config)
+                    .map_err(|error| anyhow!("{error}"))?
+            }
+            None => bail!(
+                "the plan has {} steps, so it needs the full-graph backend, which resolves \
+                 weights *and* bias from the graph artifact: pass --graph <graph.tgraph> \
+                 instead of --weights <DIR>",
+                plan.steps.len()
+            ),
         }
-        (None, Some(weights_dir)) => {
-            let resolver =
-                NamedBlobResolver::from_dir(weights_dir).map_err(|error| anyhow!("{error}"))?;
-            SystemVerilogBackend
-                .lower_execution_plan(&plan, &resolver, config)
-                .map_err(|error| anyhow!("{error}"))?
+    } else {
+        match (graph, weights) {
+            (Some(graph_path), _) => {
+                let artifact = load_graph_file(graph_path)?;
+                let resolver = graph_resolver(&artifact, graph_path)?;
+                SystemVerilogBackend
+                    .lower_execution_plan(&plan, &resolver, config)
+                    .map_err(|error| anyhow!("{error}"))?
+            }
+            (None, Some(weights_dir)) => {
+                let resolver =
+                    NamedBlobResolver::from_dir(weights_dir).map_err(|error| anyhow!("{error}"))?;
+                SystemVerilogBackend
+                    .lower_execution_plan(&plan, &resolver, config)
+                    .map_err(|error| anyhow!("{error}"))?
+            }
+            (None, None) => unreachable!("checked by the caller"),
         }
-        (None, None) => unreachable!("checked by the caller"),
     };
     let rtl_dir = dir.path(stages::RTL_DIR);
     let written = bundle
@@ -854,6 +1145,36 @@ fn emit_bundle(
         "  max |accumulator| {}, {} cycles per window",
         bundle.metadata.max_abs_accumulator, bundle.metadata.kernel_cycles_per_window
     );
+    if let Some(full) = &bundle.metadata.full_graph {
+        // The planner's RAM10 figure and the backend's arena are different
+        // measurements; both are printed so the difference is visible, and the
+        // plan estimate is never presented as the generated structure's size.
+        let arena_macroblocks = full
+            .arena_words
+            .saturating_mul(u64::from(full.word_width))
+            .div_ceil(8)
+            .div_ceil(1280);
+        println!(
+            "  full graph: input {} -> output {}, arena {} words x {} bits ({} bytes, \
+             ~{arena_macroblocks} RAM10 of 10240 bits, planner reported {} RAM10 total), \
+             {} MAC lanes, {} MACs/frame",
+            full.input.label(),
+            full.output.label(),
+            full.arena_words,
+            full.word_width,
+            full.arena_words.saturating_mul(u64::from(full.word_width)) / 8,
+            layout.resources.map_or(0, |r| r.ram10),
+            full.mac_lanes,
+            full.total_macs
+        );
+        println!(
+            "  cycles: {} unstalled generated, plan estimate {}",
+            full.cycles_unstalled, full.plan_cycles
+        );
+        for note in &full.semantic_notes {
+            println!("  note: {note}");
+        }
+    }
     println!("  bundle digest: {}", bundle.metadata.bundle_digest);
     for file in bundle.files() {
         println!("    {} ({:?})", file.name, file.kind);
@@ -967,6 +1288,18 @@ fn print_checks(checks: &[ChainCheck], format: OutputFormat) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/// Weight resolver for a graph artifact, reading its blob from beside it.
+fn graph_resolver<'a>(
+    artifact: &'a GraphArtifact,
+    graph_path: &Path,
+) -> Result<GraphWeightResolver<'a>> {
+    let base = graph_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    GraphWeightResolver::load(artifact, base).map_err(|error| anyhow!("{error}"))
+}
 
 fn load_graph_file(path: &Path) -> Result<GraphArtifact> {
     tessera::frontend::load_artifact(path)

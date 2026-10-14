@@ -43,6 +43,7 @@
 //! installation discoverable through `MLIR_SYS_230_PREFIX` (and
 //! `TABLEGEN_230_PREFIX` when ODS-generated dialect bindings are ever enabled).
 
+pub mod analysis;
 mod artifact;
 mod emit;
 #[cfg(test)]
@@ -50,15 +51,22 @@ mod fixtures;
 mod pipeline;
 pub mod quant;
 
-pub use artifact::{
-    ArgumentRole, ArtifactMetrics, DEFAULT_FUNCTION_NAME, ElementType, FilterStorageLayout,
-    LayerBinding, LayerKind, MLIR_ARTIFACT_FORMAT, MLIR_ARTIFACT_SCHEMA_VERSION, MeliorProvenance,
-    MlirArgument, MlirArtifact, MlirError, MlirFilterLayout, MlirOptions, MlirProvenance,
-    MlirStage, OperatorBinding, OperatorKind, PaddingSpec, PipelineStage, Quantization,
-    StructuralMetrics, TensorBinding, WeightPacking, WeightReference, content_hash, memref_type,
-    tensor_type,
+pub use analysis::{
+    ANALYSIS_FORMAT, ANALYSIS_SCHEMA_VERSION, AnalysisCounts, AnalyzedBuffer, LoopNest,
+    ModuleAnalysis, OpTag, TAG_PREFIX, analysis_verification_available, analyze,
 };
-pub use emit::{EmittedModule, emit_module, emit_text};
+
+pub use artifact::{
+    ArgumentRole, ArtifactMetrics, BiasContribution, CodeRange, DEFAULT_FUNCTION_NAME, ElementType,
+    FilterStorageLayout, LayerBinding, LayerKind, MLIR_ARTIFACT_FORMAT,
+    MLIR_ARTIFACT_SCHEMA_VERSION, MeliorProvenance, MlirArgument, MlirArtifact, MlirError,
+    MlirFilterLayout, MlirOptions, MlirProvenance, MlirStage, OperatorBinding, OperatorKind,
+    PaddingSpec, PipelineStage, ProvenanceCheck, Quantization, StructuralMetrics, TensorBinding,
+    WeightPacking, WeightReference, content_hash, memref_type, tensor_type,
+};
+pub use emit::{
+    EmittedModule, TAG_ADD, TAG_CONV, TAG_EPILOGUE, TAG_PAD, TAG_UPSAMPLE, emit_module, emit_text,
+};
 pub use pipeline::{
     OptimizationOutcome, PINNED_MELIOR_VERSION, default_pipeline, melior_available,
     render_pipeline, run_pipeline,
@@ -125,11 +133,14 @@ pub fn lower(
         function: options.function_name.clone(),
         stage: MlirStage::Tensor,
         module: emitted.module,
+        input_shape: emitted.input_shape,
         arguments: emitted.arguments,
+        tensors: emitted.tensors,
         layers: emitted.layers,
         operators: emitted.operators,
         output: emitted.output,
         metrics: emitted.metrics,
+        analysis: None,
         provenance: MlirProvenance {
             source_format: source.format.to_string(),
             source_schema_version: source.schema_version,
@@ -170,7 +181,12 @@ pub fn optimize(artifact: &MlirArtifact) -> Result<MlirArtifact, MlirError> {
     }
     let stages = pipeline::default_pipeline();
     let outcome = pipeline::run_pipeline(&artifact.module, &stages)?;
-    let structural = structural_metrics(&outcome.module);
+    // The analysis is the optimizer's real output: the planning stage is driven
+    // from the loop and buffer structure of the text that comes out of the pass
+    // pipeline, and the artifact carries that structure so a later stage (or a
+    // reader) does not have to re-derive it or re-run MLIR.
+    let analysis = analysis::analyze(&outcome.module, PINNED_MELIOR_VERSION, &stages)?;
+    let structural = analysis.structural();
     let mut optimized = artifact.clone();
     optimized.stage = MlirStage::Planning;
     optimized.provenance.melior = Some(MeliorProvenance {
@@ -180,65 +196,8 @@ pub fn optimize(artifact: &MlirArtifact) -> Result<MlirArtifact, MlirError> {
     optimized.provenance.module_hash = content_hash(&outcome.module);
     optimized.metrics.structural = Some(structural);
     optimized.module = outcome.module;
+    optimized.analysis = Some(analysis);
     Ok(optimized)
-}
-
-/// Count the planning-relevant structures of a module text.
-///
-/// These are static structural estimates read off the IR, not measured DDR
-/// traffic or cycle counts, and the artifact records them under
-/// [`StructuralMetrics`] so reports can label them accordingly.
-pub fn structural_metrics(module: &str) -> StructuralMetrics {
-    let mut metrics = StructuralMetrics {
-        linalg_ops: 0,
-        affine_loops: 0,
-        memref_allocs: 0,
-        allocated_bytes: 0,
-    };
-    for line in module.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("affine.for ") {
-            metrics.affine_loops += 1;
-        }
-        if let Some((_, rest)) = trimmed.split_once("= ") {
-            if rest.starts_with("linalg.") {
-                metrics.linalg_ops += 1;
-            }
-        }
-        if let Some(bytes) = allocation_bytes(line) {
-            metrics.memref_allocs += 1;
-            metrics.allocated_bytes += bytes;
-        }
-    }
-    metrics
-}
-
-/// Size of a static `memref.alloc`/`memref.alloca` result on one line.
-fn allocation_bytes(line: &str) -> Option<u64> {
-    if !line.contains("memref.alloc") && !line.contains("memref.alloca") {
-        return None;
-    }
-    let start = line.rfind("memref<")?;
-    let rest = &line[start + "memref<".len()..];
-    let end = rest.find('>')?;
-    let body = &rest[..end];
-    let mut parts = body.split('x').peekable();
-    let mut elements: u64 = 1;
-    while let Some(part) = parts.next() {
-        if parts.peek().is_none() {
-            // Last component is the element type, e.g. `i8` or `f32`.
-            let bytes = match part {
-                "i1" | "i8" => 1,
-                "i16" | "f16" | "bf16" => 2,
-                "i32" | "f32" => 4,
-                "i64" | "f64" | "index" => 8,
-                _ => return None,
-            };
-            return Some(elements * bytes);
-        }
-        elements = elements.checked_mul(part.parse::<u64>().ok()?)?;
-    }
-    None
 }
 
 #[cfg(test)]
@@ -253,7 +212,9 @@ mod tests {
             function: DEFAULT_FUNCTION_NAME.to_string(),
             stage: MlirStage::Tensor,
             module: module.to_string(),
+            input_shape: vec![1, 4, 4, 3],
             arguments: Vec::new(),
+            tensors: Vec::new(),
             layers: Vec::new(),
             operators: Vec::new(),
             output: TensorBinding {
@@ -262,6 +223,7 @@ mod tests {
                 element: ElementType::I8,
                 point: None,
                 scale: None,
+                code_range: Some(CodeRange::new(-127, 127)),
             },
             metrics: ArtifactMetrics {
                 operators: 0,
@@ -271,6 +233,7 @@ mod tests {
                 requantizations: 0,
                 structural: None,
             },
+            analysis: None,
             provenance: MlirProvenance {
                 source_format: "tessera.graph".to_string(),
                 source_schema_version: 1,
@@ -280,43 +243,6 @@ mod tests {
                 module_hash: content_hash(module),
             },
         }
-    }
-
-    #[test]
-    fn structural_metrics_read_allocations_and_loops() {
-        let module = "\
-module {
-  func.func @f() {
-    %alloc = memref.alloc() : memref<1x1x1x1xi32>
-    %alloc_0 = memref.alloc() {alignment = 64 : i64} : memref<1x34x34x3xi8>
-    %alloc_1 = memref.alloc() {alignment = 64 : i64} : memref<1x32x32x32xi8>
-    affine.for %i = 0 to 1 {
-      affine.for %j = 0 to 16 {
-      }
-    }
-    %0 = linalg.generic {indexing_maps = []} ins() outs() {^bb0: linalg.yield}
-    return
-  }
-}
-";
-        let metrics = structural_metrics(module);
-        assert_eq!(metrics.memref_allocs, 3);
-        assert_eq!(metrics.affine_loops, 2);
-        assert_eq!(metrics.linalg_ops, 1);
-        assert_eq!(metrics.allocated_bytes, 4 + 34 * 34 * 3 + 32 * 32 * 32);
-    }
-
-    #[test]
-    fn allocation_sizes_reject_dynamic_shapes() {
-        assert_eq!(
-            allocation_bytes("%a = memref.alloc() : memref<1x2x3xi8>"),
-            Some(6)
-        );
-        assert_eq!(
-            allocation_bytes("%a = memref.alloc() : memref<1x?x3xi8>"),
-            None
-        );
-        assert_eq!(allocation_bytes("%a = memref.subview %b"), None);
     }
 
     const TRIVIAL_MODULE: &str = "module {\n  func.func @f() {\n    return\n  }\n}\n";

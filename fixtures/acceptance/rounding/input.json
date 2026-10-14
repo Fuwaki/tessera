@@ -1,0 +1,56 @@
+{
+  "format": "tessera.acceptance_input.v1",
+  "fixture": "rounding",
+  "shape": {
+    "c": 4,
+    "h": 2,
+    "w": 2
+  },
+  "derivation": [
+    "point-0 activation codes, driven directly into the graph input (no image dequantization step)"
+  ],
+  "frames": [
+    {
+      "index": 0,
+      "codes": [
+        -2,
+        2,
+        0,
+        -2,
+        4,
+        4,
+        4,
+        2,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "index": 1,
+      "codes": [
+        2,
+        0,
+        4,
+        -1,
+        -4,
+        0,
+        4,
+        -1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  ]
+}

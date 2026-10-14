@@ -73,6 +73,10 @@ secondary = ["minimize_ddr_bytes", "minimize_ram10"]
 
 [constraints]
 max_frame_cycles = 10_000_000
+# Bit-exact against the *compiled fixed-point contract* ((acc*M0 + round) >> shift,
+# half-away-from-zero), not against the training f32 requantization factors: those are
+# approximated by the serialized 17-bit M0 and the shift, and each plan step
+# records the worst-case relative error it incurred.
 require_bit_exact = true
 allow_cpu_layer_dispatch = false
 

@@ -23,7 +23,9 @@ Tessera treats both as hardware backends of one compiler, not as one code genera
 - A hardware-aware planner that can reject infeasible designs before RTL emission.
 - Multiple execution models: dedicated, streaming, shared-tile, and hybrid.
 - A stable execution-plan format between planning and RTL generation.
-- Deterministic RTL generation and bit-exact verification.
+- Deterministic RTL generation, verified bit-exactly against the compiled
+  fixed-point contract (the training `f32` requantization is approximated, with
+  the per-step error bound recorded).
 - Synthesis and board measurements usable to calibrate cost models.
 
 ### Recommended
@@ -321,7 +323,11 @@ Initial acceptance criteria:
 1. Rust manifest import reproduces graph shapes and quantization metadata.
 2. Rust/MLIR reference matches existing `ng.eval` on deterministic vectors.
 3. Plan validation rejects resource or cycle overflow.
-4. Generated RTL is bit-exact on supported operators.
+4. Generated RTL is bit-exact on supported operators *against the compiled
+   fixed-point contract*: `(acc*M0 + round) >> shift`, half-away-from-zero. The training
+   `f32` factors are approximated by the serialized `M0`/`shift`, and the
+   worst-case relative error of that approximation is an artifact field, not a
+   hidden rounding.
 5. Efinity synthesis reports are parsed and compared with estimates.
 6. A board run confirms output and schedule counters for one fixed model.
 
@@ -379,7 +385,7 @@ The current repository begins as one crate to keep iteration cheap; modules may 
 - Shared tile kernel for one DW→PW block.
 - BRAM ping-pong and fixed schedule.
 - SystemVerilog generation.
-- Verilator bit-exact test.
+- Verilator test against the fixed-point reference.
 
 ### M5: closed loop
 
@@ -390,7 +396,7 @@ The current repository begins as one crate to keep iteration cheap; modules may 
 
 ### Status at v0.1
 
-M1-M3 are implemented: the graph IR and manifest frontend, deterministic MLIR emission (with in-process optimization behind the optional `melior` feature), the Ti60 target model and layout search, and the persisted stage artifacts with cross-stage provenance verification. M4 is implemented for a deliberately narrow envelope — one streaming pointwise-dot kernel with a Verilator bit-exact test — and rejects the rest of the plan space by name, so M5 (whole-model RTL, synthesis reports, board measurement) remains open. DMA scheduling and the shared-tile backend are not implemented.
+M1-M3 are implemented: the graph IR and manifest frontend, deterministic MLIR emission (with in-process optimization behind the optional `melior` feature), the Ti60 target model and layout search, and the persisted stage artifacts with cross-stage provenance verification. M4 is implemented for a deliberately narrow envelope — one streaming pointwise-dot kernel with a Verilator test against the fixed-point reference — and rejects the rest of the plan space by name, so M5 (whole-model RTL, synthesis reports, board measurement) remains open. DMA scheduling and the shared-tile backend are not implemented.
 
 ## 12. Non-goals and risks
 

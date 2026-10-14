@@ -1,0 +1,52 @@
+format = "tessera.policy"
+schema_version = 1
+
+[constraints]
+allow_cpu_layer_dispatch = false
+max_frame_cycles = 50000000
+require_bit_exact = true
+
+[fusion]
+allow = ["depthwise_requant_pointwise", "short_residual"]
+forbid = ["fanout_value"]
+
+[hint]
+prefer_bram_over_ddr = false
+prefer_fusion = false
+prefer_shared_engines = false
+
+[memory]
+allow_ping_pong = true
+max_ping_pong_buffers = 2
+placements = ["bram"]
+
+[objective]
+primary = "minimize_cycles"
+secondary = ["minimize_ddr_bytes"]
+
+[search]
+execution_modes = ["shared_tile"]
+granularities = ["frame"]
+max_candidates = 200000
+seed = 1
+tile_heights = [16, 32, 48]
+tile_widths = [16, 32, 64]
+utilisation_percent = 85
+
+[[operator_override]]
+allowed_pe = [1, 2, 3, 4]
+allowed_simd = [1, 2, 4, 8, 16]
+allowed_tap_parallel = [1]
+pattern = "conv2d"
+
+[[operator_override]]
+allowed_pe = [1, 2, 4]
+allowed_simd = [1, 2, 4, 8, 16]
+allowed_tap_parallel = [1]
+pattern = "depthwise_conv2d"
+
+[[operator_override]]
+allowed_pe = [1, 2, 4]
+allowed_simd = [1, 2, 4, 8, 16]
+allowed_tap_parallel = [1]
+pattern = "pointwise_conv2d"

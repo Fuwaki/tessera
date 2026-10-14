@@ -27,7 +27,12 @@
 //! * `add` is lowered to a two-input elementwise op whose requantization factor
 //!   is `scale(source_point) / scale(point)`, read from the graph's point
 //!   scales rather than from the op's `scale` field (which the manifest
-//!   contract defines as the *destination* point scale).
+//!   contract defines as the *destination* point scale). The reference requantizes
+//!   and clamps only the branch and leaves the sum unclamped
+//!   (`fpga_st_train/src/intref.rs:257-268`), so an `add` output carries the
+//!   *sum* of its operands' code intervals — `[-254, 254]` on a symmetric
+//!   `qmax = 127` model — as [`ElemType::I9`] in a 16-bit word. It is never
+//!   narrowed to `i8`, and every produced tensor records its exact interval.
 //! * `upsample_nearest2x` is lowered with scale 2 and a doubled output shape.
 //! * `quantize_u8_output` is lowered to an elementwise op whose activation is
 //!   the unsigned output clamp `[0, output_qmax]`.
@@ -36,15 +41,39 @@ use crate::graph::{
     Graph, GraphError, GraphOp, Layer, LayerKind, Padding as GraphPadding, PointRef,
 };
 use crate::layout::{
-    Activation, ActivationKind, ElemType, OpKind, Requant, Rounding, TensorId, TensorShape,
+    Activation, ActivationKind, CodeRange, ElemType, OpKind, Requant, Rounding, TensorId,
+    TensorShape,
 };
 use crate::mlir::quant::{ClampSpec, QuantError, serialize_requant};
+use crate::mlir::{
+    ArgumentRole, LayerBinding, MlirArtifact, ModuleAnalysis, OperatorKind,
+    PaddingSpec as MlirPadding, WeightPacking,
+};
 use crate::planner::{
     ConvDetail, ElementwiseDetail, OpDetail, Padding as PlanPadding, PlanInput, PrimitiveOp,
     TensorDesc, UpsampleDetail,
 };
 use std::collections::BTreeMap;
 use std::fmt;
+
+/// Name of a non-layer operator step: the point it writes when that is
+/// unambiguous, with an execution-order suffix when a model writes the same point
+/// more than once.
+///
+/// Both lowering paths must agree on this, because the full-graph backend checks a
+/// plan's step names against its own graph lowering. The manifest graph writes
+/// points in place, and the real `ink_dw` model adds the same point twice (a
+/// residual add, then a skip add after an upsample), so a point-only name is not
+/// unique; an operator-index name is unique but is not derivable from the MLIR
+/// module alone. Counting occurrences per point, in execution order, is derivable
+/// from both.
+fn elementwise_name(prefix: &str, point: Option<u32>, occurrence: u32) -> String {
+    match (point, occurrence) {
+        (Some(point), 1) => format!("{prefix}.{point}"),
+        (Some(point), nth) => format!("{prefix}.{point}.{nth}"),
+        (None, nth) => format!("{prefix}.op{nth}"),
+    }
+}
 
 /// Name of the planner tensor that carries a layer's weights.
 ///
@@ -140,6 +169,10 @@ pub enum LowerError {
     Quant { layer: String, source: QuantError },
     /// The graph contains a construct this adapter cannot lower.
     Invalid { detail: String },
+    /// The MLIR artifact is unusable or its provenance does not hold.
+    Artifact { detail: String },
+    /// The optimized IR does not contain the structure the bindings promise.
+    Analysis { detail: String },
 }
 
 impl fmt::Display for LowerError {
@@ -150,6 +183,10 @@ impl fmt::Display for LowerError {
                 write!(f, "lower: layer {layer}: requantization: {source}")
             }
             LowerError::Invalid { detail } => write!(f, "lower: {detail}"),
+            LowerError::Artifact { detail } => write!(f, "lower: MLIR artifact: {detail}"),
+            LowerError::Analysis { detail } => {
+                write!(f, "lower: optimized module: {detail}")
+            }
         }
     }
 }
@@ -232,6 +269,9 @@ struct Builder<'a> {
     current: Vec<Option<TensorId>>,
     /// Number of tensors already written for each point.
     versions: Vec<u32>,
+    /// How many `add` / `upsample_nearest2x` steps have already written a point,
+    /// so a repeated write is named `add.<point>.<n>` in both lowering paths.
+    elementwise_writes: std::collections::BTreeMap<(u8, u32), u32>,
     /// Tensor holding the unsigned image, once a head layer has produced it.
     image: Option<TensorId>,
     /// Shape of the unsigned image, for the cross-check against the graph.
@@ -253,30 +293,54 @@ impl<'a> Builder<'a> {
             tensors: Vec::new(),
             current: vec![None; graph.point_count()],
             versions: vec![0; graph.point_count()],
+            elementwise_writes: std::collections::BTreeMap::new(),
             image: None,
             image_shape: None,
             ops: Vec::new(),
             report: LowerReport::default(),
         };
         let input_point = graph.input_point().index();
-        let tensor = builder.push_tensor(
+        // `intref.rs:195-197` quantizes the image onto point 0 with the symmetric
+        // clamp, so the input tensor carries exactly that interval.
+        let qmax = graph.act_qmax() as i64;
+        let tensor = builder.push_tensor_coded(
             format!("p{input_point}.v0"),
             TensorShape::new(1, input.channels, input.height, input.width),
             ElemType::I8,
+            Some(CodeRange::new(-qmax, qmax)),
         );
         builder.current[input_point] = Some(tensor);
         builder
     }
 
     fn push_tensor(&mut self, name: String, shape: TensorShape, elem: ElemType) -> TensorId {
+        self.push_tensor_coded(name, shape, elem, None)
+    }
+
+    /// Push a tensor with the exact interval of codes it carries.
+    fn push_tensor_coded(
+        &mut self,
+        name: String,
+        shape: TensorShape,
+        elem: ElemType,
+        code_range: Option<CodeRange>,
+    ) -> TensorId {
         let id = TensorId::new(self.tensors.len() as u32);
         self.tensors.push(TensorDesc {
             id,
             name,
             shape,
             elem,
+            code_range,
         });
         id
+    }
+
+    /// The interval a tensor carries, if the lowering bounded it.
+    fn code_range(&self, id: TensorId) -> Option<CodeRange> {
+        self.tensors
+            .get(id.get() as usize)
+            .and_then(|tensor| tensor.code_range)
     }
 
     fn point_tensor(
@@ -296,6 +360,13 @@ impl<'a> Builder<'a> {
             })
     }
 
+    /// Next occurrence index for a non-layer write to `point`, in execution order.
+    fn next_elementwise_write(&mut self, kind: u8, point: u32) -> u32 {
+        let counter = self.elementwise_writes.entry((kind, point)).or_insert(0);
+        *counter += 1;
+        *counter
+    }
+
     fn layer(&self, name: &str) -> Result<&'a Layer, LowerError> {
         self.graph
             .layer_named(name)
@@ -304,6 +375,11 @@ impl<'a> Builder<'a> {
             })
     }
 
+    /// Lower one graph op, in execution order.
+    ///
+    /// Non-layer steps are named by the point they write plus an occurrence suffix
+    /// ([`elementwise_name`]), because a graph may add or upsample the *same* point
+    /// more than once and the MLIR-derived plan must arrive at the same names.
     fn lower_op(&mut self, op: &GraphOp) -> Result<(), LowerError> {
         match op {
             GraphOp::Conv {
@@ -395,7 +471,12 @@ impl<'a> Builder<'a> {
         let requant = requant_of(self.graph, layer, &name)?;
         let padding = padding_of(layer, &name)?;
 
-        let output = self.write_point(out_point, out_shape, output_elem(layer));
+        let (elem, range) = elem_for_range(
+            i64::from(activation.clamp_lo),
+            i64::from(activation.clamp_hi),
+            layer.out_unsigned,
+        );
+        let output = self.write_point(out_point, out_shape, elem, Some(range));
         if layer.out_unsigned {
             // An unsigned head produces the image whether it writes the sentinel
             // or a real point; the graph IR allows both, and the last unsigned
@@ -426,7 +507,8 @@ impl<'a> Builder<'a> {
         point: crate::graph::PointId,
         source_point: crate::graph::PointId,
     ) -> Result<(), LowerError> {
-        let name = format!("add.{}", point.get());
+        let occurrence = self.next_elementwise_write(b'a', point.get());
+        let name = elementwise_name("add", Some(point.get()), occurrence);
         let destination = self.point_tensor(point, "add")?;
         let source = self.point_tensor(source_point, "add")?;
         let shape = self.tensors[destination.get() as usize].shape;
@@ -463,7 +545,7 @@ impl<'a> Builder<'a> {
         let requant = Requant {
             m0: i64::from(spec.multiplier[0]),
             shift: spec.shift as i32,
-            rounding: Rounding::HalfUp,
+            rounding: Rounding::HalfAwayFromZero,
             saturate_lo: spec.clamp.lower as i32,
             saturate_hi: spec.clamp.upper as i32,
             per_channel_multipliers: Vec::new(),
@@ -476,7 +558,29 @@ impl<'a> Builder<'a> {
             spec.multiplier[0],
             spec.shift
         ));
-        let output = self.write_point(PointRef::Point(point), shape, ElemType::I8);
+        // The sum of the two operand intervals: the branch is requantized and
+        // clamped by the add itself, the trunk carries whatever its producer
+        // carries, and the reference does not clamp the sum. The branch interval is
+        // the branch tensor's squeezed by the clamp: the emitted datapath clamps it
+        // to `[lower, upper]`, and a factor at most one cannot move a code outside
+        // the interval it came from.
+        let branch_source = self
+            .code_range(source)
+            .unwrap_or_else(|| CodeRange::new(-(act_qmax as i64), act_qmax as i64));
+        let branch_range = if factor <= 1.0 {
+            CodeRange::new(
+                branch_source.lo.max(spec.clamp.lower),
+                branch_source.hi.min(spec.clamp.upper),
+            )
+        } else {
+            CodeRange::new(spec.clamp.lower, spec.clamp.upper)
+        };
+        let trunk_range = self
+            .code_range(destination)
+            .unwrap_or_else(|| CodeRange::new(-(act_qmax as i64), act_qmax as i64));
+        let sum_range = trunk_range.sum(branch_range);
+        let (elem, range) = elem_for_range(sum_range.lo, sum_range.hi, false);
+        let output = self.write_point(PointRef::Point(point), shape, elem, Some(range));
         self.ops.push(PrimitiveOp {
             name,
             kind: OpKind::Add,
@@ -491,7 +595,8 @@ impl<'a> Builder<'a> {
     }
 
     fn lower_upsample(&mut self, point: crate::graph::PointId) -> Result<(), LowerError> {
-        let name = format!("upsample_nearest2x.{}", point.get());
+        let occurrence = self.next_elementwise_write(b'u', point.get());
+        let name = elementwise_name("upsample_nearest2x", Some(point.get()), occurrence);
         let input = self.point_tensor(point, "upsample")?;
         let in_shape = self.tensors[input.get() as usize].shape;
         let out_shape = TensorShape {
@@ -510,7 +615,12 @@ impl<'a> Builder<'a> {
                     detail: format!("upsample on point {}: width overflow", point.get()),
                 })?,
         };
-        let output = self.write_point(PointRef::Point(point), out_shape, ElemType::I8);
+        // Duplication changes no code.
+        let (elem, range) = (
+            self.tensors[input.get() as usize].elem,
+            self.code_range(input),
+        );
+        let output = self.write_point(PointRef::Point(point), out_shape, elem, range);
         self.ops.push(PrimitiveOp {
             name,
             kind: OpKind::NearestUpsample2x,
@@ -526,7 +636,12 @@ impl<'a> Builder<'a> {
             detail: "quantize_u8_output: no operator produced the image".to_string(),
         })?;
         let shape = self.tensors[image.get() as usize].shape;
-        let output = self.push_tensor("output.u8".to_string(), shape, ElemType::U8);
+        let output = self.push_tensor_coded(
+            "output.u8".to_string(),
+            shape,
+            ElemType::U8,
+            Some(CodeRange::new(0, self.graph.output_qmax() as i64)),
+        );
         self.ops.push(PrimitiveOp {
             name: "quantize_u8_output".to_string(),
             kind: OpKind::QuantizeOutput,
@@ -546,17 +661,29 @@ impl<'a> Builder<'a> {
 
     /// Allocate the next tensor for a point (or for the image sentinel) and make
     /// it the point's current value.
-    fn write_point(&mut self, target: PointRef, shape: TensorShape, elem: ElemType) -> TensorId {
+    fn write_point(
+        &mut self,
+        target: PointRef,
+        shape: TensorShape,
+        elem: ElemType,
+        code_range: Option<CodeRange>,
+    ) -> TensorId {
         match target {
             PointRef::Point(id) => {
                 let version = self.versions[id.index()];
                 self.versions[id.index()] += 1;
-                let tensor = self.push_tensor(format!("p{}.v{version}", id.get()), shape, elem);
+                let tensor = self.push_tensor_coded(
+                    format!("p{}.v{version}", id.get()),
+                    shape,
+                    elem,
+                    code_range,
+                );
                 self.current[id.index()] = Some(tensor);
                 tensor
             }
             PointRef::ImageSentinel => {
-                let tensor = self.push_tensor("image.v0".to_string(), shape, elem);
+                let tensor =
+                    self.push_tensor_coded("image.v0".to_string(), shape, elem, code_range);
                 self.image = Some(tensor);
                 self.image_shape = Some((shape.c, shape.h, shape.w));
                 tensor
@@ -600,14 +727,6 @@ impl<'a> Builder<'a> {
                 image_shape,
             },
         ))
-    }
-}
-
-fn output_elem(layer: &Layer) -> ElemType {
-    if layer.out_unsigned {
-        ElemType::U8
-    } else {
-        ElemType::I8
     }
 }
 
@@ -688,7 +807,7 @@ fn requant_of(graph: &Graph, layer: &Layer, name: &str) -> Result<Requant, Lower
     Ok(Requant {
         m0: i64::from(m0),
         shift: spec.shift as i32,
-        rounding: Rounding::HalfUp,
+        rounding: Rounding::HalfAwayFromZero,
         saturate_lo: spec.clamp.lower as i32,
         saturate_hi: spec.clamp.upper as i32,
         per_channel_multipliers: spec.multiplier.iter().map(|m| i64::from(*m)).collect(),
@@ -764,6 +883,25 @@ fn padding_of(layer: &Layer, _name: &str) -> Result<PlanPadding, LowerError> {
     })
 }
 
+/// Element type and interval for a tensor that carries `[lo, hi]`.
+///
+/// The interval decides the arithmetic width (`ElemType::I9` is a nine-bit value
+/// in a sixteen-bit word) and is recorded next to the element type, so no stage
+/// has to infer a datapath width from a container again.
+pub fn elem_for_range(lo: i64, hi: i64, unsigned: bool) -> (ElemType, CodeRange) {
+    let range = CodeRange::new(lo, hi);
+    let elem = if unsigned && lo >= 0 && hi > i8::MAX as i64 && hi <= u8::MAX as i64 {
+        ElemType::U8
+    } else if range.fits_i8() {
+        ElemType::I8
+    } else if range.signed_bits() <= 9 {
+        ElemType::I9
+    } else {
+        ElemType::I16
+    };
+    (elem, range)
+}
+
 /// Worst-case relative error, in parts per million, saturating at `u32::MAX`.
 fn ppm(relative: f64) -> u32 {
     let value = (relative * 1_000_000.0).ceil();
@@ -773,5 +911,686 @@ fn ppm(relative: f64) -> u32 {
         u32::MAX
     } else {
         value as u32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Optimized MLIR artifact -> planner primitive graph
+// ---------------------------------------------------------------------------
+
+/// Lower an *optimized* MLIR artifact into the planner's primitive graph.
+///
+/// This is the planning path that actually consumes the optimizer's output. The
+/// module it reads is the bufferized, loop-lowered, fused text the pass pipeline
+/// produced, and every operator it emits is checked against the structured
+/// analysis of that text before the plan is returned:
+///
+/// * an operator implemented as IR structure (`conv`, `add`, `upsample`) must
+///   still carry its operations in the optimized module, and a convolution must
+///   appear in a loop nest, so a pass that changed or dropped its work is
+///   detected instead of being reported as a statistic;
+/// * a padded convolution must have materialized its padded buffer, with the
+///   exact padded shape this lowering derives from the layer's padding rule and
+///   the input shape;
+/// * tensor shapes, element types and code intervals come from the artifact's
+///   tensor table, which the emitter wrote from the same walk that produced the
+///   module text — nothing is recovered from generated arithmetic.
+///
+/// Graph-stage artifacts are rejected: [`crate::mlir::optimize`] has to have run.
+pub fn lower_mlir_artifact(
+    artifact: &MlirArtifact,
+) -> Result<(PlanInput, LowerReport), LowerError> {
+    artifact
+        .validate_header()
+        .map_err(|error| LowerError::Artifact {
+            detail: error.to_string(),
+        })?;
+    artifact.check(None).map_err(|error| LowerError::Artifact {
+        detail: error.to_string(),
+    })?;
+    let analysis = artifact.analyzed().map_err(|error| LowerError::Artifact {
+        detail: error.to_string(),
+    })?;
+
+    let mut builder = MlirBuilder::new(artifact, analysis)?;
+    for operator in &artifact.operators {
+        builder.lower_operator(operator)?;
+    }
+    builder.finish()
+}
+
+/// Builder that turns persisted MLIR bindings plus the analysis of the optimized
+/// module into a [`PlanInput`].
+struct MlirBuilder<'a> {
+    artifact: &'a MlirArtifact,
+    analysis: &'a ModuleAnalysis,
+    tensors: Vec<TensorDesc>,
+    ids: BTreeMap<String, TensorId>,
+    ops: Vec<PrimitiveOp>,
+    report: LowerReport,
+    /// Occurrence counters for repeated non-layer writes, keyed like the graph
+    /// path's, so both paths name a step identically.
+    elementwise_writes: std::collections::BTreeMap<(u8, u32), u32>,
+    input: Option<TensorId>,
+    output: Option<TensorId>,
+}
+
+impl<'a> MlirBuilder<'a> {
+    fn new(artifact: &'a MlirArtifact, analysis: &'a ModuleAnalysis) -> Result<Self, LowerError> {
+        let mut builder = MlirBuilder {
+            artifact,
+            analysis,
+            tensors: Vec::new(),
+            ids: BTreeMap::new(),
+            ops: Vec::new(),
+            report: LowerReport::default(),
+            elementwise_writes: std::collections::BTreeMap::new(),
+            input: None,
+            output: None,
+        };
+        let input = artifact
+            .tensor("input")
+            .ok_or_else(|| LowerError::Artifact {
+                detail: "the artifact names no `input` activation".to_string(),
+            })?;
+        for operator in &artifact.operators {
+            if operator.kind == OperatorKind::QuantizeU8 {
+                continue;
+            }
+            for produced in &operator.produces {
+                if let Some(tensor) = artifact.tensor(produced) {
+                    builder.define(tensor)?;
+                }
+            }
+        }
+        let input_id = builder.define(input)?;
+        builder.input = Some(input_id);
+        builder.report.notes.push(format!(
+            "lowered from the optimized module ({} operations, {} loops, {} buffers, module hash {})",
+            analysis.counts.operations,
+            analysis.counts.loops,
+            analysis.counts.buffers,
+            crate::mlir::content_hash(&artifact.module)
+        ));
+        Ok(builder)
+    }
+
+    /// Register one activation tensor from the artifact's tensor table.
+    fn define(&mut self, tensor: &crate::mlir::TensorBinding) -> Result<TensorId, LowerError> {
+        if let Some(existing) = self.ids.get(&tensor.ssa_name) {
+            return Ok(*existing);
+        }
+        let range = tensor.code_range.map(plan_range);
+        let shape = plan_shape(&tensor.shape)?;
+        // The element type follows from the transport the module chose and the
+        // exact interval: a widened value transported in `i16` is a nine-bit code
+        // while it fits, an interval beyond a signed byte in an `i8` container is
+        // the unsigned image head (the emitter's documented convention), and
+        // anything else in a byte is a signed code.
+        let elem = match (tensor.element, range) {
+            (crate::mlir::ElementType::I8, Some(range))
+                if range.lo >= 0 && range.hi > i8::MAX as i64 =>
+            {
+                ElemType::U8
+            }
+            (crate::mlir::ElementType::I8, Some(range)) if range.fits_i8() => ElemType::I8,
+            (crate::mlir::ElementType::I16, Some(range)) if range.signed_bits() <= 9 => {
+                ElemType::I9
+            }
+            (crate::mlir::ElementType::I16, _) => ElemType::I16,
+            _ => ElemType::I8,
+        };
+        let id = TensorId::new(self.tensors.len() as u32);
+        self.tensors.push(TensorDesc {
+            id,
+            name: tensor.ssa_name.clone(),
+            shape,
+            elem,
+            code_range: range,
+        });
+        self.ids.insert(tensor.ssa_name.clone(), id);
+        Ok(id)
+    }
+
+    fn tensor(&self, ssa: &str) -> Result<TensorId, LowerError> {
+        self.ids
+            .get(ssa)
+            .copied()
+            .ok_or_else(|| LowerError::Artifact {
+                detail: format!(
+                    "the artifact references activation {ssa:?}, which it does not describe"
+                ),
+            })
+    }
+
+    fn lower_operator(
+        &mut self,
+        operator: &crate::mlir::OperatorBinding,
+    ) -> Result<(), LowerError> {
+        self.require_ir_work(operator)?;
+        match operator.kind {
+            OperatorKind::Conv2d
+            | OperatorKind::DepthwiseConv2d
+            | OperatorKind::PointwiseConv2d => self.lower_conv(operator),
+            OperatorKind::Relu => {
+                self.report.notes.push(format!(
+                    "operator {}: `relu` is a scheduling marker; the saturation is carried by the \
+                     convolution epilogue",
+                    operator.index
+                ));
+                if self.analysis.tag_count(&operator.tag) != 0 {
+                    return Err(LowerError::Analysis {
+                        detail: format!(
+                            "the relu marker {} unexpectedly has {} operations in the optimized module",
+                            operator.tag,
+                            self.analysis.tag_count(&operator.tag)
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            OperatorKind::Add => self.lower_add(operator),
+            OperatorKind::UpsampleNearest2x => self.lower_upsample(operator),
+            OperatorKind::QuantizeU8 => self.lower_quantize(operator),
+        }
+    }
+
+    /// Every operator that the emitter lowers to real IR must still be there.
+    fn require_ir_work(&self, operator: &crate::mlir::OperatorBinding) -> Result<(), LowerError> {
+        let structural = matches!(
+            operator.kind,
+            OperatorKind::Conv2d
+                | OperatorKind::DepthwiseConv2d
+                | OperatorKind::PointwiseConv2d
+                | OperatorKind::Add
+                | OperatorKind::UpsampleNearest2x
+        );
+        if structural && self.analysis.tag_count(&operator.tag) == 0 {
+            return Err(LowerError::Analysis {
+                detail: format!(
+                    "operator {} ({:?}, tag {}) has no operations in the optimized module; the \
+                     primitive lowering would not be driven by the optimized IR",
+                    operator.index, operator.kind, operator.tag
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn lower_conv(&mut self, operator: &crate::mlir::OperatorBinding) -> Result<(), LowerError> {
+        let layer_name = operator.layer.clone().ok_or_else(|| LowerError::Artifact {
+            detail: format!("convolution operator {} names no layer", operator.index),
+        })?;
+        let layer = self
+            .artifact
+            .layer(&layer_name)
+            .ok_or_else(|| LowerError::Artifact {
+                detail: format!("the artifact has no binding for layer {layer_name:?}"),
+            })?;
+        let input = self.tensor(&operator.consumes[0])?;
+        let output = self.tensor(&operator.produces[0])?;
+        let kind = match operator.kind {
+            OperatorKind::Conv2d => OpKind::Conv2d,
+            OperatorKind::DepthwiseConv2d => OpKind::DepthwiseConv2d,
+            OperatorKind::PointwiseConv2d => OpKind::PointwiseConv2d,
+            other => {
+                return Err(LowerError::Artifact {
+                    detail: format!(
+                        "operator {} is not a convolution ({other:?})",
+                        operator.index
+                    ),
+                });
+            }
+        };
+
+        // The planner reads a convolution's kernel from the weight tensor's
+        // spatial extents, so the tensor is `(n, c, kh, kw)` in the storage
+        // layout the artifact recorded for the filter argument.
+        let filter = self
+            .artifact
+            .argument(ArgumentRole::Filter, Some(&layer_name))
+            .ok_or_else(|| LowerError::Artifact {
+                detail: format!("layer {layer_name:?} has no filter argument"),
+            })?;
+        let weight_elem = match filter.weight.as_ref().map(|weight| weight.packing) {
+            Some(WeightPacking::I8x1) => ElemType::I8,
+            Some(WeightPacking::I4x2) => ElemType::I4,
+            None => ElemType::I8,
+        };
+        let weight_shape = match (filter.shape.as_slice(), &filter.weight) {
+            ([kh, kw, channels], Some(weight))
+                if weight.mlir_layout == crate::mlir::MlirFilterLayout::Hwc =>
+            {
+                TensorShape::new(narrow(*channels)?, 1, narrow(*kh)?, narrow(*kw)?)
+            }
+            ([out_channels, kh, kw, in_channels], _) => TensorShape::new(
+                narrow(*out_channels)?,
+                narrow(*in_channels)?,
+                narrow(*kh)?,
+                narrow(*kw)?,
+            ),
+            (shape, _) => {
+                return Err(LowerError::Artifact {
+                    detail: format!(
+                        "layer {layer_name:?}: filter argument has shape {shape:?}, which is neither \
+                         HWC nor FHWC"
+                    ),
+                });
+            }
+        };
+        let weights = self.push_tensor(weight_tensor_name(&layer_name), weight_shape, weight_elem);
+        let bias = if layer.bias.requires_tensor() {
+            Some(self.push_tensor(
+                bias_tensor_name(&layer_name),
+                TensorShape::new(layer.quantization.multiplier.len() as u32, 1, 1, 1),
+                ElemType::I32,
+            ))
+        } else {
+            self.report.notes.push(format!(
+                "layer {layer_name}: int32 bias is all zero and was dropped (exact identity)"
+            ));
+            None
+        };
+
+        let requant = requant_of_mlir(&layer.quantization, &layer_name)?;
+        let activation = activation_of_mlir(&layer.quantization);
+        let padding = padding_of_mlir(layer.padding);
+        let (buffer_bytes, nest_ordinal, nest_depth, fused, others) =
+            self.verify_conv(operator, layer, input)?;
+        self.report.notes.push(format!(
+            "layer {layer_name}: {} operations in the optimized module, nest {nest_ordinal} at              depth {nest_depth} ({}{others} other operator(s)), {buffer_bytes} bytes of buffers",
+            self.analysis.tag_count(&operator.tag),
+            if fused { "fused with " } else { "alone, " },
+        ));
+
+        self.ops.push(PrimitiveOp {
+            name: layer_name,
+            kind,
+            inputs: vec![input],
+            outputs: vec![output],
+            detail: OpDetail::Conv(ConvDetail {
+                weights,
+                bias,
+                groups: layer.groups,
+                stride: layer.stride,
+                padding,
+                requant,
+                activation,
+            }),
+        });
+        Ok(())
+    }
+
+    /// Cross-check a convolution against the optimized IR it must have produced.
+    fn verify_conv(
+        &self,
+        operator: &crate::mlir::OperatorBinding,
+        layer: &LayerBinding,
+        input: TensorId,
+    ) -> Result<(u64, usize, u32, bool, usize), LowerError> {
+        let nest = self
+            .analysis
+            .nest_of_operator(operator.index)
+            .ok_or_else(|| LowerError::Analysis {
+                detail: format!(
+                    "layer {}: no loop nest in the optimized module performs operator {} ({})",
+                    layer.layer, operator.index, operator.tag
+                ),
+            })?;
+        let nest_ordinal = nest.ordinal;
+        let nest_depth = nest.depth;
+        let fused = nest.fused;
+        let others = nest
+            .operator_indices
+            .iter()
+            .filter(|index| **index != operator.index)
+            .count();
+        // The padded buffer is the optimizer's own materialization of the padding
+        // rule; if it does not exist with the expected shape, the plan and the
+        // optimized IR disagree.
+        let amount = layer.padding.amount() as u64;
+        let input_desc =
+            self.tensors
+                .get(input.get() as usize)
+                .ok_or_else(|| LowerError::Artifact {
+                    detail: "convolution input tensor is missing from the plan".to_string(),
+                })?;
+        let mut bytes = 0u64;
+        if amount > 0 {
+            let nhwc = [
+                input_desc.shape.n as u64,
+                input_desc.shape.h as u64 + 2 * amount,
+                input_desc.shape.w as u64 + 2 * amount,
+                input_desc.shape.c as u64,
+            ];
+            let element = if input_desc.elem == ElemType::I8 {
+                "i8"
+            } else {
+                "i16"
+            };
+            let buffers = self.analysis.buffers_with(&nhwc, element);
+            let buffer = buffers.first().ok_or_else(|| LowerError::Analysis {
+                detail: format!(
+                    "layer {}: the optimized module has no {element} buffer of the padded input \
+                     shape {nhwc:?}; padding did not materialize as the binding claims",
+                    layer.layer
+                ),
+            })?;
+            bytes = buffer.bytes.unwrap_or(0);
+        }
+        Ok((bytes, nest_ordinal, nest_depth, fused, others))
+    }
+
+    fn lower_add(&mut self, operator: &crate::mlir::OperatorBinding) -> Result<(), LowerError> {
+        let input = self.tensor(&operator.consumes[0])?;
+        let branch = self.tensor(&operator.consumes[1])?;
+        let output = self.tensor(&operator.produces[0])?;
+        let spec = operator
+            .quantization
+            .as_ref()
+            .ok_or_else(|| LowerError::Artifact {
+                detail: format!(
+                    "add operator {} records no branch requantization",
+                    operator.index
+                ),
+            })?;
+        let requant = Requant {
+            m0: spec.multiplier.first().copied().map(i64::from).unwrap_or(0),
+            shift: spec.shift as i32,
+            rounding: Rounding::HalfAwayFromZero,
+            saturate_lo: spec.clamp.lower as i32,
+            saturate_hi: spec.clamp.upper as i32,
+            per_channel_multipliers: Vec::new(),
+            multiplier_error_ppm: Some(ppm(spec.max_relative_error)),
+        };
+        // The output is *not* clamped: the reference leaves the sum unclamped, and
+        // the interval the tensor table recorded is the emitter's exact sum of the
+        // trunk interval and the requantization-clamped branch interval.
+        let range = self
+            .tensors
+            .get(output.get() as usize)
+            .and_then(|tensor| tensor.code_range)
+            .unwrap_or(CodeRange::new(i16::MIN as i64, i16::MAX as i64));
+        let name = self.elementwise_step_name(b'a', "add", operator)?;
+        self.report.notes.push(format!(
+            "{name}: branch requantized onto the destination grid (M0={} shift={}), sum carried \
+             unclamped in [{}, {}]",
+            requant.m0, requant.shift, range.lo, range.hi
+        ));
+        self.ops.push(PrimitiveOp {
+            name,
+            kind: OpKind::Add,
+            inputs: vec![input, branch],
+            outputs: vec![output],
+            detail: OpDetail::Elementwise(ElementwiseDetail {
+                requant: Some(requant),
+                activation: Activation {
+                    kind: ActivationKind::None,
+                    clamp_lo: range.lo as i32,
+                    clamp_hi: range.hi as i32,
+                },
+            }),
+        });
+        Ok(())
+    }
+
+    /// Name of a non-layer step, using the shared rule: the point it writes, with
+    /// an execution-order suffix when the point is written more than once.
+    fn elementwise_step_name(
+        &mut self,
+        kind: u8,
+        prefix: &str,
+        operator: &crate::mlir::OperatorBinding,
+    ) -> Result<String, LowerError> {
+        let point = operator.points.first().copied();
+        let counter = self
+            .elementwise_writes
+            .entry((kind, point.unwrap_or(u32::MAX)))
+            .or_insert(0);
+        *counter += 1;
+        let occurrence = *counter;
+        if point.is_none() && operator.index == 0 {
+            return Err(LowerError::Artifact {
+                detail: format!(
+                    "{prefix}: the operator binding names neither a point nor an index, so the \
+                     step cannot be named"
+                ),
+            });
+        }
+        Ok(elementwise_name(prefix, point, occurrence))
+    }
+
+    fn lower_upsample(
+        &mut self,
+        operator: &crate::mlir::OperatorBinding,
+    ) -> Result<(), LowerError> {
+        let input = self.tensor(&operator.consumes[0])?;
+        let output = self.tensor(&operator.produces[0])?;
+        let name = self.elementwise_step_name(b'u', "upsample_nearest2x", operator)?;
+        self.ops.push(PrimitiveOp {
+            name,
+            kind: OpKind::NearestUpsample2x,
+            inputs: vec![input],
+            outputs: vec![output],
+            detail: OpDetail::Upsample(UpsampleDetail { scale: 2 }),
+        });
+        Ok(())
+    }
+
+    /// Materialize the unsigned output step.
+    ///
+    /// The module implements the head's unsigned clamp inside the convolution
+    /// epilogue (`%upper = arith.const 255`), so the graph operator carries no
+    /// operations of its own; the planner models the manifest's
+    /// `quantize_u8_output` step explicitly, exactly as the graph lowering does,
+    /// and the interval comes from the value the head produced.
+    fn lower_quantize(
+        &mut self,
+        operator: &crate::mlir::OperatorBinding,
+    ) -> Result<(), LowerError> {
+        let image = self.tensor(&operator.consumes[0])?;
+        let shape = self.tensors[image.get() as usize].shape;
+        let upper = self
+            .tensors
+            .get(image.get() as usize)
+            .and_then(|tensor| tensor.code_range)
+            .map(|range| range.hi)
+            .ok_or_else(|| LowerError::Artifact {
+                detail: "the unsigned image tensor records no code interval".to_string(),
+            })?;
+        if upper <= 0 {
+            return Err(LowerError::Analysis {
+                detail: format!(
+                    "operator {}: the value feeding the unsigned output carries no positive codes",
+                    operator.index
+                ),
+            });
+        }
+        let output = self.push_tensor_coded(
+            "output.u8".to_string(),
+            shape,
+            ElemType::U8,
+            Some(CodeRange::new(0, upper)),
+        );
+        self.output = Some(output);
+        self.report.notes.push(format!(
+            "quantize_u8_output: the optimized module applies the head clamp [0, {upper}] inside \
+             the convolution epilogue; the planner models it as this step"
+        ));
+        self.ops.push(PrimitiveOp {
+            name: "quantize_u8_output".to_string(),
+            kind: OpKind::QuantizeOutput,
+            inputs: vec![image],
+            outputs: vec![output],
+            detail: OpDetail::Elementwise(ElementwiseDetail {
+                requant: None,
+                activation: Activation {
+                    kind: ActivationKind::UnsignedClamp,
+                    clamp_lo: 0,
+                    clamp_hi: upper as i32,
+                },
+            }),
+        });
+        Ok(())
+    }
+
+    fn push_tensor(&mut self, name: String, shape: TensorShape, elem: ElemType) -> TensorId {
+        let id = TensorId::new(self.tensors.len() as u32);
+        self.tensors.push(TensorDesc {
+            id,
+            name,
+            shape,
+            elem,
+            code_range: None,
+        });
+        id
+    }
+
+    /// Like [`Self::push_tensor`], with a code interval.
+    fn push_tensor_coded(
+        &mut self,
+        name: String,
+        shape: TensorShape,
+        elem: ElemType,
+        code_range: Option<CodeRange>,
+    ) -> TensorId {
+        let id = TensorId::new(self.tensors.len() as u32);
+        self.tensors.push(TensorDesc {
+            id,
+            name,
+            shape,
+            elem,
+            code_range,
+        });
+        id
+    }
+
+    fn finish(self) -> Result<(PlanInput, LowerReport), LowerError> {
+        let input = self.input.ok_or_else(|| LowerError::Artifact {
+            detail: "no input activation was lowered".to_string(),
+        })?;
+        let output = self
+            .output
+            .or_else(|| self.ops.last().and_then(|op| op.outputs.first().copied()))
+            .ok_or_else(|| LowerError::Artifact {
+                detail: "the artifact produced no output activation".to_string(),
+            })?;
+        let name = if self.artifact.function.trim().is_empty() {
+            "tessera.mlir".to_string()
+        } else {
+            self.artifact.function.clone()
+        };
+        let plan = PlanInput {
+            name,
+            tensors: self.tensors,
+            ops: self.ops,
+            inputs: vec![input],
+            outputs: vec![output],
+        };
+        plan.validate().map_err(|detail| LowerError::Invalid {
+            detail: format!("lowered primitive graph is invalid: {detail}"),
+        })?;
+        Ok((plan, self.report))
+    }
+}
+
+/// Convert a persisted code interval into the planner's vocabulary.
+fn plan_range(range: crate::mlir::CodeRange) -> CodeRange {
+    CodeRange::new(range.lo, range.hi)
+}
+
+/// Narrow a shape extent from the module's `u64` to the planner's `u32`.
+fn narrow(value: u64) -> Result<u32, LowerError> {
+    u32::try_from(value).map_err(|_| LowerError::Artifact {
+        detail: format!("extent {value} does not fit the planner's shape"),
+    })
+}
+
+/// Convert an `NHWC` tensor shape into the planner's `NCHW` shape.
+fn plan_shape(shape: &[u64]) -> Result<TensorShape, LowerError> {
+    let [n, h, w, c] = shape else {
+        return Err(LowerError::Artifact {
+            detail: format!("activation shape {shape:?} is not rank-4 NHWC"),
+        });
+    };
+    if *n != 1 {
+        return Err(LowerError::Artifact {
+            detail: format!("v1 models are batch 1, but the module carries batch {n}"),
+        });
+    }
+    let (c, h, w) = (narrow(*c)?, narrow(*h)?, narrow(*w)?);
+    if c == 0 || h == 0 || w == 0 {
+        return Err(LowerError::Artifact {
+            detail: format!("activation shape {shape:?} has a zero extent"),
+        });
+    }
+    Ok(TensorShape::new(1, c, h, w))
+}
+
+/// Fixed-point requantization of a persisted convolution binding.
+fn requant_of_mlir(
+    quantization: &crate::mlir::Quantization,
+    layer: &str,
+) -> Result<Requant, LowerError> {
+    let m0 = quantization
+        .multiplier
+        .iter()
+        .copied()
+        .max()
+        .ok_or_else(|| LowerError::Artifact {
+            detail: format!("layer {layer}: the artifact records no requantization multipliers"),
+        })?;
+    Ok(Requant {
+        m0: i64::from(m0),
+        shift: quantization.shift as i32,
+        rounding: Rounding::HalfAwayFromZero,
+        saturate_lo: quantization.clamp.lower as i32,
+        saturate_hi: quantization.clamp.upper as i32,
+        per_channel_multipliers: quantization
+            .multiplier
+            .iter()
+            .map(|value| i64::from(*value))
+            .collect(),
+        multiplier_error_ppm: Some(ppm(quantization.max_relative_error)),
+    })
+}
+
+/// Saturation regime of a persisted convolution binding.
+fn activation_of_mlir(quantization: &crate::mlir::Quantization) -> Activation {
+    match quantization.clamp.kind {
+        crate::mlir::ClampKind::UnsignedOutput => Activation {
+            kind: ActivationKind::UnsignedClamp,
+            clamp_lo: quantization.clamp.lower as i32,
+            clamp_hi: quantization.clamp.upper as i32,
+        },
+        crate::mlir::ClampKind::Relu => Activation {
+            kind: ActivationKind::Relu,
+            clamp_lo: quantization.clamp.lower as i32,
+            clamp_hi: quantization.clamp.upper as i32,
+        },
+        crate::mlir::ClampKind::Symmetric => Activation {
+            kind: ActivationKind::None,
+            clamp_lo: quantization.clamp.lower as i32,
+            clamp_hi: quantization.clamp.upper as i32,
+        },
+    }
+}
+
+/// Padding rule of a persisted layer binding.
+fn padding_of_mlir(padding: MlirPadding) -> PlanPadding {
+    match padding {
+        MlirPadding::None => PlanPadding::Zero {
+            top: 0,
+            bottom: 0,
+            left: 0,
+            right: 0,
+        },
+        MlirPadding::Reflect { .. } => PlanPadding::Reflect,
+        MlirPadding::Zero { amount } => PlanPadding::Zero {
+            top: amount,
+            bottom: amount,
+            left: amount,
+            right: amount,
+        },
     }
 }

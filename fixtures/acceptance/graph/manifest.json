@@ -1,0 +1,293 @@
+{
+  "format": "fpga_st_train.int8.v1",
+  "arch": "acceptance-graph",
+  "bits": {
+    "acts": 8,
+    "weights": 8
+  },
+  "act_qmax": 127.0,
+  "output_qmax": 255.0,
+  "weight_qmax": 127.0,
+  "notes": [
+    "Acceptance fixture: reflect-padded 3x3 stem, depthwise 3x3, 1x1 pointwise, residual add (9-bit carry), nearest 2x upsample, unsigned head.",
+    "Point scales are exact powers of two so every requant factor is exact in f32; the residual branch factor is exactly 1.0.",
+    "The expected codes come from an independent scalar reference over manifest.json + weights.bin only; see docs/verification.md."
+  ],
+  "points": [
+    "image",
+    "stem.out",
+    "dw.out",
+    "mid.out"
+  ],
+  "point_scales": [
+    0.0078125,
+    0.015625,
+    0.03125,
+    0.015625
+  ],
+  "graph": [
+    {
+      "op": "conv",
+      "layer": "stem",
+      "point": 0,
+      "scale": 0.0078125
+    },
+    {
+      "op": "relu",
+      "layer": "stem"
+    },
+    {
+      "op": "conv",
+      "layer": "dw",
+      "point": 1,
+      "scale": 0.015625
+    },
+    {
+      "op": "relu",
+      "layer": "dw"
+    },
+    {
+      "op": "conv",
+      "layer": "mid",
+      "point": 2,
+      "scale": 0.03125
+    },
+    {
+      "op": "relu",
+      "layer": "mid"
+    },
+    {
+      "op": "add",
+      "point": 3,
+      "source_point": 1,
+      "scale": 0.015625
+    },
+    {
+      "op": "upsample_nearest2x",
+      "point": 3
+    },
+    {
+      "op": "conv",
+      "layer": "head",
+      "point": 3,
+      "scale": 0.015625
+    },
+    {
+      "op": "quantize_u8_output",
+      "scale": 0.003921568859368563
+    }
+  ],
+  "layers": [
+    {
+      "name": "stem",
+      "op": "conv2d+relu",
+      "in_channels": 3,
+      "out_channels": 4,
+      "groups": 1,
+      "act_bits": 8,
+      "weight_bits": 8,
+      "act_zero_point": 0,
+      "out_relu": true,
+      "out_unsigned": false,
+      "kernel": [
+        3,
+        3
+      ],
+      "stride": [
+        1,
+        1
+      ],
+      "reflect_pad": 1,
+      "in_point": 0,
+      "out_point": 1,
+      "in_scale": 0.0078125,
+      "out_scale": 0.015625,
+      "weight_scale": [
+        0.019999999552965164,
+        0.03999999910593033,
+        0.05999999865889549,
+        0.07999999821186066
+      ],
+      "bias": [
+        3.125,
+        -0.003124999813735485,
+        0.009374999441206455,
+        0.0625
+      ],
+      "bias_int32": [
+        20000,
+        -10,
+        20,
+        100
+      ],
+      "requant": [
+        0.009999999776482582,
+        0.019999999552965164,
+        0.029999999329447746,
+        0.03999999910593033
+      ],
+      "weight_offset": 0,
+      "weight_count": 108,
+      "weight_byte_offset": 0,
+      "weight_bytes": 108
+    },
+    {
+      "name": "dw",
+      "op": "depthwise_conv2d+relu",
+      "in_channels": 4,
+      "out_channels": 4,
+      "groups": 4,
+      "act_bits": 8,
+      "weight_bits": 8,
+      "act_zero_point": 0,
+      "out_relu": true,
+      "out_unsigned": false,
+      "kernel": [
+        3,
+        3
+      ],
+      "stride": [
+        1,
+        1
+      ],
+      "reflect_pad": 1,
+      "in_point": 1,
+      "out_point": 2,
+      "in_scale": 0.015625,
+      "out_scale": 0.03125,
+      "weight_scale": [
+        0.10000000149011612,
+        0.20000000298023224,
+        0.30000001192092896,
+        0.4000000059604645
+      ],
+      "bias": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "bias_int32": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "requant": [
+        0.05000000074505806,
+        0.10000000149011612,
+        0.15000000596046448,
+        0.20000000298023224
+      ],
+      "weight_offset": 108,
+      "weight_count": 36,
+      "weight_byte_offset": 108,
+      "weight_bytes": 36
+    },
+    {
+      "name": "mid",
+      "op": "conv2d+relu",
+      "in_channels": 4,
+      "out_channels": 4,
+      "groups": 1,
+      "act_bits": 8,
+      "weight_bits": 8,
+      "act_zero_point": 0,
+      "out_relu": true,
+      "out_unsigned": false,
+      "kernel": [
+        1,
+        1
+      ],
+      "stride": [
+        1,
+        1
+      ],
+      "reflect_pad": 0,
+      "in_point": 2,
+      "out_point": 3,
+      "in_scale": 0.03125,
+      "out_scale": 0.015625,
+      "weight_scale": [
+        0.006000000052154064,
+        0.012000000104308128,
+        0.017999999225139618,
+        0.024000000208616257
+      ],
+      "bias": [
+        0.0,
+        0.0,
+        0.02812499925494194,
+        -0.015000000596046448
+      ],
+      "bias_int32": [
+        0,
+        0,
+        50,
+        -20
+      ],
+      "requant": [
+        0.012000000104308128,
+        0.024000000208616257,
+        0.035999998450279236,
+        0.04800000041723251
+      ],
+      "weight_offset": 144,
+      "weight_count": 16,
+      "weight_byte_offset": 144,
+      "weight_bytes": 16
+    },
+    {
+      "name": "head",
+      "op": "conv2d",
+      "in_channels": 4,
+      "out_channels": 3,
+      "groups": 1,
+      "act_bits": 8,
+      "weight_bits": 8,
+      "act_zero_point": 0,
+      "out_relu": false,
+      "out_unsigned": true,
+      "kernel": [
+        1,
+        1
+      ],
+      "stride": [
+        1,
+        1
+      ],
+      "reflect_pad": 0,
+      "in_point": 3,
+      "out_point": 4,
+      "in_scale": 0.015625,
+      "out_scale": 0.003921568859368563,
+      "weight_scale": [
+        0.07999999821186066,
+        0.10000000149011612,
+        0.05999999865889549
+      ],
+      "bias": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "bias_int32": [
+        0,
+        0,
+        0
+      ],
+      "requant": [
+        0.31874996423721313,
+        0.3984374701976776,
+        0.23906247317790985
+      ],
+      "weight_offset": 160,
+      "weight_count": 12,
+      "weight_byte_offset": 160,
+      "weight_bytes": 12
+    }
+  ],
+  "weight_file": "weights.bin",
+  "weight_packing": "i8-x1",
+  "weight_bytes": 172
+}

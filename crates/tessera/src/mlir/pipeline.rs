@@ -119,7 +119,7 @@ mod imp {
     use melior::Context;
     use melior::dialect::DialectRegistry;
     use melior::ir::Module;
-    use melior::ir::operation::OperationLike;
+    use melior::ir::operation::{OperationLike, OperationPrintingFlags};
     use melior::pass::PassManager;
     use melior::utility::{parse_pass_pipeline, register_all_dialects, register_all_passes};
     use std::sync::{Mutex, Once};
@@ -176,8 +176,19 @@ mod imp {
                 detail: format!("pipeline `{pipeline}` failed: {error}"),
             })?;
 
+        // Locations are printed: the emitter's `loc("tessera:<role>#<index>")`
+        // tags are the stable mapping from optimized loops back to the operators
+        // that produced them, and they must survive into the persisted text for
+        // the analysis (and a reader) to see.
+        let module = module
+            .as_operation()
+            .to_string_with_flags(OperationPrintingFlags::new().enable_debug_info(true, false))
+            .map_err(|error| MlirError::Melior {
+                detail: format!("printing the optimized module failed: {error}"),
+            })?;
+
         Ok(OptimizationOutcome {
-            module: module.as_operation().to_string(),
+            module,
             pipeline: stages.to_vec(),
         })
     }

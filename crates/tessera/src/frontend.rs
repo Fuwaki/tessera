@@ -12,7 +12,7 @@ use crate::graph::{
     BitWidth, Bits, Channels, Dtype, Extent, Graph, GraphArtifact, GraphError, GraphOp, GroupCount,
     Kernel, Layer, LayerId, LayerKind, LayerName, LayerOp, MANIFEST_FORMAT, Packing, Padding,
     Point, PointId, PointName, PointRef, Provenance, QMax, QuantContract, RequantCoefficients,
-    Rounding, Scale, Stride, WeightStream, ZeroPoint, scale_eq,
+    Rounding, Scale, Stride, WeightStream, ZeroPoint, check_weight_file, scale_eq,
 };
 use serde::Deserialize;
 use std::fmt::Write as _;
@@ -144,6 +144,8 @@ pub fn import_manifest(path: &Path) -> FrontendResult<GraphArtifact> {
     let origin = manifest_path.display().to_string();
     let text = read_text(&manifest_path)?;
     let raw: RawManifest = parse_manifest(&text, &origin)?;
+    // Resolve the blob strictly inside the manifest directory before touching the disk.
+    check_weight_file(&raw.weight_file)?;
     let weights = read_bytes(&weights_dir.join(&raw.weight_file))?;
     artifact_from_raw(&raw, &text, &weights, &origin)
 }
@@ -174,6 +176,9 @@ fn artifact_from_raw(
     weights: &[u8],
     origin: &str,
 ) -> FrontendResult<GraphArtifact> {
+    // The blob reference becomes artifact provenance, so it must be safe on every entry
+    // point, not only when the manifest is read from disk.
+    check_weight_file(&raw.weight_file)?;
     if weights.len() != raw.weight_bytes {
         return Err(GraphError::WeightFileLength {
             file: raw.weight_file.clone(),
@@ -1483,6 +1488,97 @@ mod tests {
         let tampered = text.replace("\"weight_codes\": 172", "\"weight_codes\": 63");
         std::fs::write(&path, tampered).unwrap();
         assert_eq!(load_artifact(&path), Err(GraphError::MetricsStale));
+    }
+
+    #[test]
+    fn load_rejects_a_tampered_bit_width_as_a_typed_error() {
+        let dir = TempDir::new("tamper-bits");
+        let artifact = import(FIXTURE_W8, 172);
+        let path = dir.path.join("graph.tgraph");
+        save_artifact(&artifact, &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let tampered = text.replace("\"acts\": 8", "\"acts\": 0");
+        assert_ne!(text, tampered, "the tamper pattern did not match");
+        std::fs::write(&path, tampered).unwrap();
+
+        // A zero width must be a diagnostic, not an underflow in `signed_qmax`.
+        let error = load_artifact(&path).unwrap_err();
+        assert!(
+            matches!(error, GraphError::Json { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("bit width 0"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_a_tampered_weight_file_path() {
+        let dir = TempDir::new("tamper-path");
+        let artifact = import(FIXTURE_W8, 172);
+        let path = dir.path.join("graph.tgraph");
+        save_artifact(&artifact, &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let tampered = text.replace(
+            "\"weight_file\": \"weights.bin\"",
+            "\"weight_file\": \"/etc/shadow\"",
+        );
+        assert_ne!(text, tampered, "the tamper pattern did not match");
+        std::fs::write(&path, tampered).unwrap();
+
+        // Staging resolves this name against the artifact directory.
+        assert_eq!(
+            load_artifact(&path),
+            Err(GraphError::UnsafeWeightPath {
+                file: "/etc/shadow".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_a_weight_file_outside_the_manifest_directory() {
+        for declared in [
+            "../weights.bin",
+            "/tmp/weights.bin",
+            "blobs/../../weights.bin",
+            "",
+        ] {
+            let manifest = FIXTURE_W8.replace(
+                "\"weight_file\": \"weights.bin\"",
+                &format!("\"weight_file\": \"{declared}\""),
+            );
+            assert_ne!(manifest, FIXTURE_W8, "the tamper pattern did not match");
+            assert_eq!(
+                import_manifest_str(&manifest, &vec![0u8; 172], "fixture.json"),
+                Err(GraphError::UnsafeWeightPath {
+                    file: declared.to_owned()
+                }),
+                "declared {declared:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn import_never_reads_a_weight_file_outside_the_manifest_directory() {
+        // The escaping blob exists and has the declared length, so only the path check
+        // can reject it: an unguarded import would have read it successfully.
+        let outer = TempDir::new("escape");
+        let inner = outer.path.join("model");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(outer.path.join("weights.bin"), vec![0u8; 172]).unwrap();
+        let manifest = FIXTURE_W8.replace(
+            "\"weight_file\": \"weights.bin\"",
+            "\"weight_file\": \"../weights.bin\"",
+        );
+        std::fs::write(inner.join("manifest.json"), manifest).unwrap();
+
+        assert_eq!(
+            import_manifest(&inner),
+            Err(GraphError::UnsafeWeightPath {
+                file: "../weights.bin".to_owned()
+            })
+        );
     }
 
     #[test]

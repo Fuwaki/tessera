@@ -1,0 +1,1161 @@
+certainty = "optimal"
+format = "tessera.layout"
+schema_version = 1
+status = "feasible"
+
+[cycles]
+dma_cycles = 84
+mac_cycles = 10337
+setup_cycles = 448
+total_cycles = 10869
+utilisation_percent = 85
+
+[limits]
+ddr_read_bytes_per_frame = 450000000
+ddr_write_bytes_per_frame = 350000000
+dsp48 = 152
+frame_cycles = 50000000
+ram10 = 88
+xlr = 40568
+
+[objective]
+primary = "minimize_cycles"
+secondary = ["minimize_ddr_bytes"]
+
+[provenance]
+compiler_version = "0.1.0"
+graph_sha256 = "6dfc6caf9b47c1e2c7aee16ca5aa73df1f4ef1d56452502a35dbf67f550c8acd"
+policy_schema_version = 1
+policy_sha256 = "ae5feaa8d6fb67c798f23ebf4dc1f9cd61e82db7a4fb2f3184b72784091ff534"
+seed = 1
+target_name = "ti60f225"
+target_revision = "fpga_src-2026-10-10"
+target_sha256 = "0c275aa74109ba6c36511f2eb2da1a57533d38664319623100da40e8bbc553dc"
+
+[provenance.options]
+
+[rejections]
+rejected_candidates = 1
+
+[rejections.by_mode]
+
+[rejections.by_mode.shared_tile]
+candidates = 2
+feasible = 1
+
+[rejections.by_mode.shared_tile.counts]
+no_candidate = 1
+
+[rejections.by_mode.shared_tile.first_reason]
+
+[rejections.by_mode.shared_tile.first_reason.no_candidate]
+detail = "no fold assignment satisfies every budget"
+
+[rejections.counts]
+no_candidate = 1
+
+[[rejections.samples]]
+execution_mode = "shared_tile"
+fusion_enabled = false
+granularity = "frame"
+intermediate_placement = "bram"
+weight_placement = "bram"
+
+[rejections.samples.reason]
+
+[rejections.samples.reason.no_candidate]
+detail = "no fold assignment satisfies every budget"
+
+[resources]
+ddr_read_bytes_per_frame = 192
+ddr_write_bytes_per_frame = 432
+dsp48 = 3
+frame_cycles = 10869
+ram10 = 7
+xlr = 2500
+
+[search]
+expanded_nodes = 14
+explored = 2
+max_candidates = 200000
+per_candidate_budget = 100000
+truncated = false
+truncated_candidates = 0
+
+[selection]
+execution_mode = "shared_tile"
+fusion_enabled = true
+granularity = "frame"
+intermediate_placement = "bram"
+weight_placement = "bram"
+
+[selection.engine]
+accumulator_bits = 32
+activation_bits = 16
+arena_words = 1404
+name = "shared_conv0"
+pe = 1
+simd = 1
+tap_parallel = 1
+weight_bits = 8
+
+[[selection.ops]]
+fused_with = []
+input_buffer = "onchip.mid"
+op = "add.3"
+op_kind = "add"
+output_buffer = "onchip.add.3"
+pe = 1
+simd = 1
+tap_parallel = 1
+
+[[selection.ops]]
+fused_with = []
+input_buffer = "onchip.stem"
+op = "dw"
+op_kind = "depthwise_conv2d"
+output_buffer = "onchip.dw"
+pe = 1
+simd = 1
+tap_parallel = 1
+
+[[selection.ops]]
+fused_with = []
+input_buffer = "onchip.upsample_nearest2x.3"
+op = "head"
+op_kind = "pointwise_conv2d"
+output_buffer = "onchip.head"
+pe = 1
+simd = 1
+tap_parallel = 1
+
+[[selection.ops]]
+fused_with = ["dw"]
+input_buffer = "onchip.dw"
+op = "mid"
+op_kind = "pointwise_conv2d"
+output_buffer = "onchip.mid"
+pe = 1
+simd = 1
+tap_parallel = 1
+
+[[selection.ops]]
+fused_with = []
+input_buffer = "onchip.head"
+op = "quantize_u8_output"
+op_kind = "quantize_output"
+output_buffer = "onchip.quantize_u8_output"
+pe = 1
+simd = 1
+tap_parallel = 1
+
+[[selection.ops]]
+fused_with = []
+input_buffer = "stage.in.p0.v0"
+op = "stem"
+op_kind = "conv2d"
+output_buffer = "onchip.stem"
+pe = 1
+simd = 1
+tap_parallel = 1
+
+[[selection.ops]]
+fused_with = []
+input_buffer = "onchip.add.3"
+op = "upsample_nearest2x.3"
+op_kind = "nearest_upsample2x"
+output_buffer = "onchip.upsample_nearest2x.3"
+pe = 1
+simd = 1
+tap_parallel = 1
+
+[slack]
+ddr_read_bytes_per_frame = 449999808
+ddr_write_bytes_per_frame = 349999568
+dsp48 = 149
+frame_cycles = 49989131
+ram10 = 81
+xlr = 38068
+
+[[buffers]]
+base_offset_bytes = 0
+bytes = 36
+consumers = ["dw"]
+depth = 36
+name = "dw.w"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 1
+read_ports = 1
+region = "weight_rom"
+tensor = 4
+width_bits = 8
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 36
+bytes = 12
+consumers = ["head"]
+depth = 12
+name = "head.w"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 1
+read_ports = 1
+region = "weight_rom"
+tensor = 10
+width_bits = 8
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 48
+bytes = 16
+consumers = ["mid"]
+depth = 16
+name = "mid.w"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 1
+read_ports = 1
+region = "weight_rom"
+tensor = 6
+width_bits = 8
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 64
+bytes = 108
+consumers = ["stem"]
+depth = 108
+name = "stem.w"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 1
+read_ports = 1
+region = "weight_rom"
+tensor = 1
+width_bits = 8
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 0
+bytes = 16
+consumers = ["add.3"]
+depth = 4
+name = "add.3.b"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 2
+read_ports = 1
+region = "bias_rom"
+width_bits = 32
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 16
+bytes = 16
+consumers = ["dw"]
+depth = 4
+name = "dw.b"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 2
+read_ports = 1
+region = "bias_rom"
+width_bits = 32
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 32
+bytes = 12
+consumers = ["head"]
+depth = 3
+name = "head.b"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 2
+read_ports = 1
+region = "bias_rom"
+width_bits = 32
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 44
+bytes = 16
+consumers = ["mid"]
+depth = 4
+name = "mid.b"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 2
+read_ports = 1
+region = "bias_rom"
+width_bits = 32
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 60
+bytes = 12
+consumers = ["quantize_u8_output"]
+depth = 3
+name = "quantize_u8_output.b"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 2
+read_ports = 1
+region = "bias_rom"
+width_bits = 32
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 72
+bytes = 16
+consumers = ["stem"]
+depth = 4
+name = "stem.b"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 2
+read_ports = 1
+region = "bias_rom"
+tensor = 2
+width_bits = 32
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 88
+bytes = 16
+consumers = ["upsample_nearest2x.3"]
+depth = 4
+name = "upsample_nearest2x.3.b"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 2
+read_ports = 1
+region = "bias_rom"
+width_bits = 32
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 0
+bytes = 12
+consumers = ["add.3"]
+depth = 4
+name = "add.3.m0"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 1
+read_ports = 1
+region = "multiplier_rom"
+width_bits = 17
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 12
+bytes = 12
+consumers = ["dw"]
+depth = 4
+name = "dw.m0"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 1
+read_ports = 1
+region = "multiplier_rom"
+width_bits = 17
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 24
+bytes = 9
+consumers = ["head"]
+depth = 3
+name = "head.m0"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 1
+read_ports = 1
+region = "multiplier_rom"
+width_bits = 17
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 33
+bytes = 12
+consumers = ["mid"]
+depth = 4
+name = "mid.m0"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 1
+read_ports = 1
+region = "multiplier_rom"
+width_bits = 17
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 45
+bytes = 12
+consumers = ["stem"]
+depth = 4
+name = "stem.m0"
+ping_pong_depth = 1
+placement = "bram"
+producers = []
+ram10_blocks = 1
+read_ports = 1
+region = "multiplier_rom"
+width_bits = 17
+write_ports = 0
+
+[[buffers]]
+base_offset_bytes = 504
+bytes = 288
+consumers = []
+depth = 144
+name = "onchip.add.3"
+ping_pong_depth = 1
+placement = "bram"
+producers = ["add.3"]
+ram10_blocks = 1
+read_ports = 1
+region = "activation_ram"
+tensor = 8
+width_bits = 16
+write_ports = 1
+
+[[buffers]]
+base_offset_bytes = 504
+bytes = 288
+consumers = []
+depth = 144
+name = "onchip.dw"
+ping_pong_depth = 1
+placement = "bram"
+producers = ["dw"]
+ram10_blocks = 1
+read_ports = 1
+region = "activation_ram"
+tensor = 5
+width_bits = 16
+write_ports = 1
+
+[[buffers]]
+base_offset_bytes = 1944
+bytes = 864
+consumers = []
+depth = 432
+name = "onchip.head"
+ping_pong_depth = 1
+placement = "bram"
+producers = ["head"]
+ram10_blocks = 1
+read_ports = 1
+region = "activation_ram"
+tensor = 11
+width_bits = 16
+write_ports = 1
+
+[[buffers]]
+base_offset_bytes = 792
+bytes = 288
+consumers = []
+depth = 144
+name = "onchip.mid"
+ping_pong_depth = 1
+placement = "bram"
+producers = ["mid"]
+ram10_blocks = 1
+read_ports = 1
+region = "activation_ram"
+tensor = 7
+width_bits = 16
+write_ports = 1
+
+[[buffers]]
+base_offset_bytes = 0
+bytes = 864
+consumers = []
+depth = 432
+name = "onchip.quantize_u8_output"
+ping_pong_depth = 1
+placement = "bram"
+producers = ["quantize_u8_output"]
+ram10_blocks = 1
+read_ports = 1
+region = "activation_ram"
+tensor = 12
+width_bits = 16
+write_ports = 1
+
+[[buffers]]
+base_offset_bytes = 216
+bytes = 288
+consumers = []
+depth = 144
+name = "onchip.stem"
+ping_pong_depth = 1
+placement = "bram"
+producers = ["stem"]
+ram10_blocks = 1
+read_ports = 1
+region = "activation_ram"
+tensor = 3
+width_bits = 16
+write_ports = 1
+
+[[buffers]]
+base_offset_bytes = 792
+bytes = 1152
+consumers = []
+depth = 576
+name = "onchip.upsample_nearest2x.3"
+ping_pong_depth = 1
+placement = "bram"
+producers = ["upsample_nearest2x.3"]
+ram10_blocks = 2
+read_ports = 1
+region = "activation_ram"
+tensor = 9
+width_bits = 16
+write_ports = 1
+
+[[buffers]]
+base_offset_bytes = 0
+bytes = 216
+consumers = ["stem"]
+depth = 108
+name = "stage.in.p0.v0"
+ping_pong_depth = 1
+placement = "bram"
+producers = ["in.p0.v0"]
+ram10_blocks = 1
+read_ports = 1
+region = "activation_ram"
+tensor = 0
+width_bits = 16
+write_ports = 1
+
+[[buffers]]
+base_offset_bytes = 0
+bytes = 108
+consumers = ["stage.in.p0.v0"]
+depth = 108
+name = "in.p0.v0"
+ping_pong_depth = 1
+placement = "ddr"
+producers = []
+ram10_blocks = 0
+read_ports = 1
+region = "frame_buffer"
+tensor = 0
+width_bits = 8
+write_ports = 1
+
+[[buffers]]
+base_offset_bytes = 108
+bytes = 432
+consumers = []
+depth = 432
+name = "out.output.u8"
+ping_pong_depth = 1
+placement = "ddr"
+producers = ["quantize_u8_output"]
+ram10_blocks = 0
+read_ports = 1
+region = "frame_buffer"
+tensor = 12
+width_bits = 8
+write_ports = 1
+
+[[fusions]]
+consumer = "mid"
+kind = "depthwise_requant_pointwise"
+producer = "dw"
+saved_ddr_bytes = 0
+
+[[schedule]]
+engine = "shared_conv0"
+estimated_cycles = 4639
+fused_with = []
+groups = 1
+in_channels = 3
+in_spatial = [6, 6]
+input_buffer = "stage.in.p0.v0"
+inputs = [0]
+kernel = [3, 3]
+mode = "frame"
+op = "stem"
+op_kind = "conv2d"
+out_channels = 4
+out_spatial = [6, 6]
+output_buffer = "onchip.stem"
+outputs = [3]
+pe = 1
+simd = 1
+step = 0
+stride = [1, 1]
+tap_parallel = 1
+
+[schedule.activation]
+clamp_hi = 127
+clamp_lo = 0
+kind = "relu"
+
+[schedule.bias]
+elem = "i32"
+id = 2
+name = "bias:stem"
+
+[schedule.bias.shape]
+c = 1
+h = 1
+n = 4
+w = 1
+
+[schedule.cost]
+lane_iterations = 3888
+lanes = 1
+macs = 3888
+setup_cycles = 64
+utilisation_percent = 85
+
+[schedule.in_code_range]
+hi = 127
+lo = -127
+
+[schedule.out_code_range]
+hi = 127
+lo = 0
+
+[schedule.padding]
+bottom = 1
+left = 1
+reflect = true
+right = 1
+top = 1
+
+[schedule.requant]
+m0 = 92275
+multiplier_error_ppm = 8
+per_channel_multipliers = [23488, 46137, 71303, 92275]
+rounding = "half_away_from_zero"
+saturate_hi = 127
+saturate_lo = 0
+shift = 22
+
+[schedule.weights]
+elem = "i8"
+id = 1
+name = "weights:stem"
+
+[schedule.weights.shape]
+c = 3
+h = 3
+n = 4
+w = 3
+
+[[schedule]]
+engine = "shared_conv0"
+estimated_cycles = 1589
+fused_with = []
+groups = 4
+in_channels = 4
+in_spatial = [6, 6]
+input_buffer = "onchip.stem"
+inputs = [3]
+kernel = [3, 3]
+mode = "frame"
+op = "dw"
+op_kind = "depthwise_conv2d"
+out_channels = 4
+out_spatial = [6, 6]
+output_buffer = "onchip.dw"
+outputs = [5]
+pe = 1
+simd = 1
+step = 1
+stride = [1, 1]
+tap_parallel = 1
+
+[schedule.activation]
+clamp_hi = 127
+clamp_lo = 0
+kind = "relu"
+
+[schedule.cost]
+lane_iterations = 1296
+lanes = 1
+macs = 1296
+setup_cycles = 64
+utilisation_percent = 85
+
+[schedule.in_code_range]
+hi = 127
+lo = 0
+
+[schedule.out_code_range]
+hi = 127
+lo = 0
+
+[schedule.padding]
+bottom = 1
+left = 1
+reflect = true
+right = 1
+top = 1
+
+[schedule.requant]
+m0 = 83886
+multiplier_error_ppm = 1
+per_channel_multipliers = [83886, 83886, 83886, 83886]
+rounding = "half_away_from_zero"
+saturate_hi = 127
+saturate_lo = 0
+shift = 23
+
+[schedule.weights]
+elem = "i8"
+id = 4
+name = "weights:dw"
+
+[schedule.weights.shape]
+c = 1
+h = 3
+n = 4
+w = 3
+
+[[schedule]]
+engine = "shared_conv0"
+estimated_cycles = 742
+fused_with = ["dw"]
+groups = 1
+in_channels = 4
+in_spatial = [6, 6]
+input_buffer = "onchip.dw"
+inputs = [5]
+kernel = [1, 1]
+mode = "frame"
+op = "mid"
+op_kind = "pointwise_conv2d"
+out_channels = 4
+out_spatial = [6, 6]
+output_buffer = "onchip.mid"
+outputs = [7]
+pe = 1
+simd = 1
+step = 2
+stride = [1, 1]
+tap_parallel = 1
+
+[schedule.activation]
+clamp_hi = 127
+clamp_lo = 0
+kind = "relu"
+
+[schedule.cost]
+lane_iterations = 576
+lanes = 1
+macs = 576
+setup_cycles = 64
+utilisation_percent = 85
+
+[schedule.in_code_range]
+hi = 127
+lo = 0
+
+[schedule.out_code_range]
+hi = 127
+lo = 0
+
+[schedule.padding]
+bottom = 0
+left = 0
+reflect = false
+right = 0
+top = 0
+
+[schedule.requant]
+m0 = 83886
+multiplier_error_ppm = 1
+per_channel_multipliers = [83886, 83886, 83886, 83886]
+rounding = "half_away_from_zero"
+saturate_hi = 127
+saturate_lo = 0
+shift = 23
+
+[schedule.weights]
+elem = "i8"
+id = 6
+name = "weights:mid"
+
+[schedule.weights.shape]
+c = 4
+h = 1
+n = 4
+w = 1
+
+[[schedule]]
+engine = "shared_conv0"
+estimated_cycles = 403
+fused_with = []
+groups = 1
+in_channels = 4
+in_spatial = [6, 6]
+input_buffer = "onchip.mid"
+inputs = [7, 3]
+kernel = [1, 1]
+mode = "frame"
+op = "add.3"
+op_kind = "add"
+out_channels = 4
+out_spatial = [6, 6]
+output_buffer = "onchip.add.3"
+outputs = [8]
+pe = 1
+simd = 1
+step = 3
+stride = [1, 1]
+tap_parallel = 1
+
+[schedule.activation]
+clamp_hi = 127
+clamp_lo = -127
+kind = "none"
+
+[schedule.cost]
+lane_iterations = 288
+lanes = 1
+macs = 144
+setup_cycles = 64
+utilisation_percent = 85
+
+[schedule.in_code_range]
+hi = 127
+lo = 0
+
+[schedule.out_code_range]
+hi = 254
+lo = 0
+
+[schedule.requant]
+m0 = 122334
+multiplier_error_ppm = 2
+rounding = "half_away_from_zero"
+saturate_hi = 127
+saturate_lo = -127
+shift = 18
+
+[[schedule]]
+engine = "shared_conv0"
+estimated_cycles = 742
+fused_with = []
+groups = 1
+in_channels = 4
+in_spatial = [6, 6]
+input_buffer = "onchip.add.3"
+inputs = [8]
+kernel = [1, 1]
+mode = "frame"
+op = "upsample_nearest2x.3"
+op_kind = "nearest_upsample2x"
+out_channels = 4
+out_spatial = [12, 12]
+output_buffer = "onchip.upsample_nearest2x.3"
+outputs = [9]
+pe = 1
+simd = 1
+step = 4
+stride = [1, 1]
+tap_parallel = 1
+upsample_scale = 2
+
+[schedule.activation]
+clamp_hi = 127
+clamp_lo = -128
+kind = "none"
+
+[schedule.cost]
+lane_iterations = 576
+lanes = 1
+macs = 576
+setup_cycles = 64
+utilisation_percent = 85
+
+[schedule.in_code_range]
+hi = 254
+lo = 0
+
+[schedule.out_code_range]
+hi = 254
+lo = 0
+
+[[schedule]]
+engine = "shared_conv0"
+estimated_cycles = 2097
+fused_with = []
+groups = 1
+in_channels = 4
+in_spatial = [12, 12]
+input_buffer = "onchip.upsample_nearest2x.3"
+inputs = [9]
+kernel = [1, 1]
+mode = "frame"
+op = "head"
+op_kind = "pointwise_conv2d"
+out_channels = 3
+out_spatial = [12, 12]
+output_buffer = "onchip.head"
+outputs = [11]
+pe = 1
+simd = 1
+step = 5
+stride = [1, 1]
+tap_parallel = 1
+
+[schedule.activation]
+clamp_hi = 255
+clamp_lo = 0
+kind = "unsigned_clamp"
+
+[schedule.cost]
+lane_iterations = 1728
+lanes = 1
+macs = 1728
+setup_cycles = 64
+utilisation_percent = 85
+
+[schedule.in_code_range]
+hi = 254
+lo = 0
+
+[schedule.out_code_range]
+hi = 255
+lo = 0
+
+[schedule.padding]
+bottom = 0
+left = 0
+reflect = false
+right = 0
+top = 0
+
+[schedule.requant]
+m0 = 104858
+multiplier_error_ppm = 4
+per_channel_multipliers = [104858, 104858, 104858]
+rounding = "half_away_from_zero"
+saturate_hi = 255
+saturate_lo = 0
+shift = 20
+
+[schedule.weights]
+elem = "i8"
+id = 10
+name = "weights:head"
+
+[schedule.weights.shape]
+c = 4
+h = 1
+n = 3
+w = 1
+
+[[schedule]]
+engine = "shared_conv0"
+estimated_cycles = 573
+fused_with = []
+groups = 1
+in_channels = 3
+in_spatial = [12, 12]
+input_buffer = "onchip.head"
+inputs = [11]
+kernel = [1, 1]
+mode = "frame"
+op = "quantize_u8_output"
+op_kind = "quantize_output"
+out_channels = 3
+out_spatial = [12, 12]
+output_buffer = "onchip.quantize_u8_output"
+outputs = [12]
+pe = 1
+simd = 1
+step = 6
+stride = [1, 1]
+tap_parallel = 1
+
+[schedule.activation]
+clamp_hi = 255
+clamp_lo = 0
+kind = "unsigned_clamp"
+
+[schedule.cost]
+lane_iterations = 432
+lanes = 1
+macs = 432
+setup_cycles = 64
+utilisation_percent = 85
+
+[schedule.in_code_range]
+hi = 255
+lo = 0
+
+[schedule.out_code_range]
+hi = 255
+lo = 0
+
+[[tensors]]
+elem = "i8"
+id = 0
+name = "p0.v0"
+
+[tensors.shape]
+c = 3
+h = 6
+n = 1
+w = 6
+
+[[tensors]]
+elem = "i8"
+id = 1
+name = "weights:stem"
+
+[tensors.shape]
+c = 3
+h = 3
+n = 4
+w = 3
+
+[[tensors]]
+elem = "i32"
+id = 2
+name = "bias:stem"
+
+[tensors.shape]
+c = 1
+h = 1
+n = 4
+w = 1
+
+[[tensors]]
+elem = "i8"
+id = 3
+name = "p1.v0"
+
+[tensors.shape]
+c = 4
+h = 6
+n = 1
+w = 6
+
+[[tensors]]
+elem = "i8"
+id = 4
+name = "weights:dw"
+
+[tensors.shape]
+c = 1
+h = 3
+n = 4
+w = 3
+
+[[tensors]]
+elem = "i8"
+id = 5
+name = "p2.v0"
+
+[tensors.shape]
+c = 4
+h = 6
+n = 1
+w = 6
+
+[[tensors]]
+elem = "i8"
+id = 6
+name = "weights:mid"
+
+[tensors.shape]
+c = 4
+h = 1
+n = 4
+w = 1
+
+[[tensors]]
+elem = "i8"
+id = 7
+name = "p3.v0"
+
+[tensors.shape]
+c = 4
+h = 6
+n = 1
+w = 6
+
+[[tensors]]
+elem = "i9"
+id = 8
+name = "p3.v1"
+
+[tensors.shape]
+c = 4
+h = 6
+n = 1
+w = 6
+
+[[tensors]]
+elem = "i9"
+id = 9
+name = "p3.v2"
+
+[tensors.shape]
+c = 4
+h = 12
+n = 1
+w = 12
+
+[[tensors]]
+elem = "i8"
+id = 10
+name = "weights:head"
+
+[tensors.shape]
+c = 4
+h = 1
+n = 3
+w = 1
+
+[[tensors]]
+elem = "u8"
+id = 11
+name = "image.v0"
+
+[tensors.shape]
+c = 3
+h = 12
+n = 1
+w = 12
+
+[[tensors]]
+elem = "u8"
+id = 12
+name = "output.u8"
+
+[tensors.shape]
+c = 3
+h = 12
+n = 1
+w = 12

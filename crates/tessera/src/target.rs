@@ -362,7 +362,21 @@ pub struct ClockSpec {
     pub core_hz: u64,
 }
 
-/// `[budget]` section: hard device capacity made available to the planner.
+/// `[budget]` section: the **total** device capacity made available to this
+/// compiler, before any non-accelerator consumption.
+///
+/// Semantics are unambiguous and load-bearing:
+///
+/// ```text
+/// usable(resource) = budget(resource) − reserved(resource)
+/// ```
+///
+/// `budget` is the whole device (e.g. 160 DSP48 for the Ti60F225), not the
+/// free remainder; `[reserved]` ([`ReservedSpec`]) is what the rest of the
+/// design consumes outside the ML accelerator. The DDR fields are a sustained
+/// *rate* (bytes per second), not a per-frame quantity: they are converted to
+/// a per-frame byte budget against a frame-cycle count by
+/// [`Ti60Target::ddr_budget`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetSpec {
@@ -378,7 +392,13 @@ pub struct BudgetSpec {
     pub ddr_write_bytes_per_s: u64,
 }
 
-/// `[reserved]` section: resources consumed outside the ML accelerator.
+/// `[reserved]` section: resources consumed outside the ML accelerator, on
+/// the same device as [`BudgetSpec`].
+///
+/// These are *not* a second budget: the planner's usable budget is
+/// `budget − reserved` for each resource (see [`Ti60Target::usable_budget`]).
+/// A reservation larger than the corresponding budget is rejected by
+/// [`Ti60Target::validate`], never silently clamped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReservedSpec {
@@ -411,8 +431,24 @@ pub struct MacSpec {
     pub int8xint8_per_dsp48: u64,
     /// int9xint8 MAC lanes packed into one DSP48.
     pub int9xint8_per_dsp48: u64,
-    /// DSP48 blocks charged per requant lane.
+    /// DSP48 blocks charged per requant multiplier *operand chunk*.
     pub requant_lane_dsp48: u64,
+    /// Width of one signed multiply operand the DSP48's multiplier takes.
+    ///
+    /// The Efinix `EFX_DSP48` multiplier is 18×18; a wider product is built by
+    /// decomposing the wider operand into 18-bit chunks and cascading the
+    /// partial products (`IS_DECOMP_PP_MULT`, `CASCIN_ASR18`). The measured
+    /// requant unit maps a 32-bit accumulator against an 18-bit `M0` to
+    /// exactly two `EFX_DSP48`
+    /// (`fpga_src/engine/out_leaf_rq/requant_unit.map.v`), which is what this
+    /// width reproduces: `ceil(accumulator_bits / 18)` blocks per lane.
+    #[serde(default = "default_dsp_multiplier_operand_bits")]
+    pub dsp_multiplier_operand_bits: u64,
+}
+
+/// Default width of one DSP48 multiply operand.
+fn default_dsp_multiplier_operand_bits() -> u64 {
+    18
 }
 
 /// `[logic]` section: coarse XLR (logic) coefficients.
@@ -445,6 +481,42 @@ impl Default for LogicSpec {
     }
 }
 
+/// One legal physical organization of a RAM primitive.
+///
+/// A block RAM is *not* a rectangle of `max_width_bits × max_depth`. The Efinix
+/// `EFX_RAM10` is a 10 Kbit simple dual-port block whose read and write ports
+/// may only be configured to a fixed set of width/depth pairs. The vendor model
+/// (`sim_models/verilog/efx_ram10.v`) enumerates them exactly:
+///
+/// ```text
+/// width → depth
+///   1   → 8192     5  → 2048    16 → 512
+///   2   → 4096     8  → 1024    20 → 512
+///   4   → 2048    10  → 1024
+/// ```
+///
+/// There is no 40-bit organization: the widest `RAM10` port is 20 bits, and
+/// `40 × 256` (the shape a naive `max_width_bits × max_depth` rectangle would
+/// invent) is not a block at all. Treating the two maxima as independent would
+/// let a buffer claim a geometry no block can realize, so the target declares
+/// the organizations it physically supports and buffer mapping picks the one
+/// that needs the fewest blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RamMode {
+    /// Data width of one physical block in this organization.
+    pub width_bits: u64,
+    /// Addressable depth of one physical block in this organization.
+    pub depth: u64,
+}
+
+impl RamMode {
+    /// Storage cells addressable in this organization (`width × depth`).
+    pub const fn cells(self) -> u64 {
+        self.width_bits * self.depth
+    }
+}
+
 /// One `[[ram.primitive]]` entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -461,6 +533,11 @@ pub struct RamPrimitive {
     pub read_ports: u64,
     /// Independent write ports per physical block.
     pub write_ports: u64,
+    /// Legal physical organizations (`[[ram.primitive.mode]]`). Empty means
+    /// "undeclared": mapping then falls back to a single conservative
+    /// rectangle derived from the capacity, never to independent maxima.
+    #[serde(default)]
+    pub mode: Vec<RamMode>,
 }
 
 /// `[ram]` section.
@@ -470,6 +547,30 @@ pub struct RamSection {
     /// Declared RAM primitives.
     #[serde(default)]
     pub primitive: Vec<RamPrimitive>,
+}
+
+impl RamPrimitive {
+    /// The organizations buffer mapping may choose from.
+    ///
+    /// Declared modes are used verbatim. A primitive that declares none falls
+    /// back to one conservative rectangle that *does* fit the declared bit
+    /// budget: `max_width_bits × min(max_depth, floor(capacity_bits /
+    /// max_width_bits))`. For the 10 Kbit/20-bit `EFX_RAM10` that is `20 × 512`,
+    /// which is a real organization; the fallback never invents a
+    /// `20 × 1024` block that would be twice the physical capacity.
+    pub fn effective_modes(&self) -> Vec<RamMode> {
+        if !self.mode.is_empty() {
+            return self.mode.clone();
+        }
+        let width = self.max_width_bits.max(1);
+        let depth = (self.capacity_bits / width)
+            .max(1)
+            .min(self.max_depth.max(1));
+        vec![RamMode {
+            width_bits: width,
+            depth,
+        }]
+    }
 }
 
 /// One `[[stream.primitive]]` entry.
@@ -550,6 +651,8 @@ pub struct MacMapping {
     pub lanes: MacLanes,
     /// MAC lanes packed into each DSP48.
     pub lanes_per_dsp48: u64,
+    /// Nine-bit multipliers each lane needs for its activation width.
+    pub multipliers_per_lane: u64,
     /// Selected physical packing mode.
     pub mode: MacMode,
 }
@@ -572,15 +675,19 @@ pub struct BufferRequest {
 pub struct RamMapping {
     /// Primitive used.
     pub primitive: String,
+    /// Physical organization selected for one block.
+    pub mode: RamMode,
+    /// Physical blocks consumed by one replica.
+    pub blocks_per_replica: Ram10Blocks,
     /// Physical blocks consumed (already includes replication).
     pub blocks: Ram10Blocks,
     /// Duplication factor driven by port requirements.
     pub replication: u64,
-    /// Data width after per-block width rounding.
+    /// Data width after per-block width rounding, in the selected organization.
     pub width_padded_bits: u64,
-    /// Depth after per-block depth rounding.
+    /// Depth after per-block depth rounding, in the selected organization.
     pub depth_padded: u64,
-    /// Capacity actually consumed by the payload (bits).
+    /// Capacity actually occupied by the requested payload (bits).
     pub capacity_bits_used: u64,
 }
 
@@ -658,6 +765,7 @@ impl Ti60Target {
         if self.mac.int8xint8_per_dsp48 == 0
             || self.mac.int9xint8_per_dsp48 == 0
             || self.mac.requant_lane_dsp48 == 0
+            || self.mac.dsp_multiplier_operand_bits == 0
         {
             return Err(TargetError::InvalidValue {
                 field: "mac.*".into(),
@@ -689,6 +797,57 @@ impl Ti60Target {
                     field: format!("ram.primitive[{}].read_ports", p.name),
                     detail: "must be non-zero".into(),
                 });
+            }
+            let mut seen_modes = BTreeMap::new();
+            for mode in &p.mode {
+                if mode.width_bits == 0 || mode.depth == 0 {
+                    return Err(TargetError::InvalidValue {
+                        field: format!("ram.primitive[{}].mode", p.name),
+                        detail: "width_bits and depth must be non-zero".into(),
+                    });
+                }
+                if mode.width_bits > p.max_width_bits {
+                    return Err(TargetError::InvalidValue {
+                        field: format!("ram.primitive[{}].mode", p.name),
+                        detail: format!(
+                            "organization {}x{} is wider than max_width_bits {}",
+                            mode.width_bits, mode.depth, p.max_width_bits
+                        ),
+                    });
+                }
+                if mode.depth > p.max_depth {
+                    return Err(TargetError::InvalidValue {
+                        field: format!("ram.primitive[{}].mode", p.name),
+                        detail: format!(
+                            "organization {}x{} is deeper than max_depth {}",
+                            mode.width_bits, mode.depth, p.max_depth
+                        ),
+                    });
+                }
+                if mode.cells() > p.capacity_bits {
+                    return Err(TargetError::InvalidValue {
+                        field: format!("ram.primitive[{}].mode", p.name),
+                        detail: format!(
+                            "organization {}x{} holds {} bits, above the declared capacity of {}",
+                            mode.width_bits,
+                            mode.depth,
+                            mode.cells(),
+                            p.capacity_bits
+                        ),
+                    });
+                }
+                if seen_modes
+                    .insert((mode.width_bits, mode.depth), ())
+                    .is_some()
+                {
+                    return Err(TargetError::InvalidValue {
+                        field: format!("ram.primitive[{}].mode", p.name),
+                        detail: format!(
+                            "organization {}x{} is declared twice",
+                            mode.width_bits, mode.depth
+                        ),
+                    });
+                }
             }
             if names.insert(p.name.clone(), ()).is_some() {
                 return Err(TargetError::DuplicatePrimitive {
@@ -777,19 +936,32 @@ impl Ti60Target {
 
     /// Map MAC lanes onto physical DSP48 blocks.
     ///
-    /// Operand widths select the physical packing mode: int8 activations with
-    /// int4/int8 weights use the dual mapping (int4 codes are sign-extended to
-    /// int8 before multiplication, matching the manifest contract); 9-bit
-    /// activations use the single-product integer path.
+    /// `activation_bits` is the width of the *codes* the lane multiplies, which
+    /// is the exact interval the lowering states, not the container the value
+    /// travels in. Operand widths select the physical path:
+    ///
+    /// * up to 8 bits against int8 weights uses the dual packing (two products
+    ///   share one DSP48);
+    /// * 9..=18 bits uses the single-product path, and a width beyond nine bits
+    ///   needs `ceil(bits / 9)` nine-bit multipliers per lane — the device has
+    ///   no wider multiplier, so a residual chain that widens the interval pays
+    ///   for partial products instead of being silently truncated;
+    /// * wider than 18 bits has no realization and is an error.
     pub fn map_mac(
         &self,
         activation_bits: u32,
         weight_bits: u32,
         lanes: MacLanes,
     ) -> Result<MacMapping, TargetError> {
-        let mode = match (activation_bits, weight_bits) {
-            (a, w) if a == 8 && w <= 8 => MacMode::Int8MacDual,
-            (a, w) if a == 9 && w <= 8 => MacMode::Int9MacSingle,
+        let (mode, lanes_per_dsp48, multipliers_per_lane) = match (activation_bits, weight_bits) {
+            (a, w) if (1..=8).contains(&a) && w <= 8 => {
+                (MacMode::Int8MacDual, self.mac.int8xint8_per_dsp48, 1)
+            }
+            (a, w) if (9..=18).contains(&a) && w <= 8 => (
+                MacMode::Int9MacSingle,
+                self.mac.int9xint8_per_dsp48,
+                u64::from(a).div_ceil(9),
+            ),
             _ => {
                 return Err(TargetError::UnsupportedOperandWidth {
                     activation_bits,
@@ -798,23 +970,30 @@ impl Ti60Target {
             }
         };
         self.require_mac_mode(mode)?;
-        let lanes_per_dsp48 = match mode {
-            MacMode::Int8MacDual => self.mac.int8xint8_per_dsp48,
-            MacMode::Int9MacSingle => self.mac.int9xint8_per_dsp48,
-        }
-        .max(1);
-        let dsp48 = lanes.get().div_ceil(lanes_per_dsp48);
+        let lanes_per_dsp48 = lanes_per_dsp48.max(1);
+        let products = lanes.get().saturating_mul(multipliers_per_lane);
         Ok(MacMapping {
-            dsp48: DspBlocks(dsp48),
+            dsp48: DspBlocks(products.div_ceil(lanes_per_dsp48)),
             lanes,
             lanes_per_dsp48,
+            multipliers_per_lane,
             mode,
         })
     }
 
-    /// DSP48 blocks charged for `lanes` requant lanes.
-    pub fn map_requant(&self, lanes: MacLanes) -> DspBlocks {
-        DspBlocks(lanes.get() * self.mac.requant_lane_dsp48.max(1))
+    /// DSP48 blocks charged for `lanes` requant multipliers whose wider operand
+    /// is `operand_bits` wide.
+    ///
+    /// The requant multiplier computes `|acc| × M0`, so the wider operand is
+    /// the accumulator. A DSP48 multiplies two 18-bit operands in one block;
+    /// anything wider is decomposed into 18-bit chunks whose partial products
+    /// cascade *inside* the same column, which costs one block per chunk. The
+    /// measured Ti60 requant unit (32-bit accumulator × 18-bit `M0`) maps to
+    /// two `EFX_DSP48`, so a plan is never told a 32-bit multiply is one block.
+    pub fn map_requant(&self, lanes: MacLanes, operand_bits: u32) -> DspBlocks {
+        let chunk = self.mac.dsp_multiplier_operand_bits.max(1);
+        let chunks = u64::from(operand_bits).div_ceil(chunk).max(1);
+        DspBlocks(lanes.get() * self.mac.requant_lane_dsp48.max(1) * chunks)
     }
 
     /// Coarse XLR estimate from physical lanes, engine instances and RAM10
@@ -847,10 +1026,25 @@ impl Ti60Target {
 
     /// Map a logical buffer onto physical RAM blocks.
     ///
-    /// The mapping rounds width and depth up to the primitive geometry,
-    /// checks total capacity, and replicates the memory to satisfy the
-    /// requested port count — exactly the three ways a logically small buffer
-    /// becomes several physical blocks.
+    /// One physical block is not a `max_width × max_depth` rectangle: it is a
+    /// fixed bit budget organized in a small set of legal width/depth shapes
+    /// ([`RamPrimitive::mode`]). The mapping therefore tiles the requested
+    /// `width × depth` with the cheapest legal organization
+    /// (`ceil(width/w) × ceil(depth/d)` blocks, minimized over the declared
+    /// modes), then replicates the result to satisfy the requested port count.
+    /// Bytes alone are never used as the capacity test: a 1-bit-wide,
+    /// 20 000-deep buffer needs more blocks than its bit count suggests because
+    /// no single block is that deep.
+    ///
+    /// "Cheapest" is a total order, so the result never depends on declaration
+    /// order: fewest blocks first, then the fewest wasted storage cells
+    /// (`blocks × cells − payload`), then the narrowest block, then the
+    /// shallowest.
+    ///
+    /// When a primitive declares no modes, the fallback is the single
+    /// conservative rectangle `max_width_bits × min(max_depth,
+    /// floor(capacity_bits / max_width_bits))` — again a shape that fits one
+    /// block's bit budget, never a rectangle of both maxima at once.
     pub fn map_buffer(
         &self,
         primitive: &str,
@@ -883,12 +1077,35 @@ impl Ti60Target {
             });
         }
 
-        let width_slices = req.width_bits.div_ceil(prim.max_width_bits);
-        let depth_slices = req.depth.div_ceil(prim.max_depth);
-        let geometry_blocks = width_slices * depth_slices;
+        let modes = prim.effective_modes();
         let payload_bits = req.width_bits.saturating_mul(req.depth);
-        let capacity_blocks = payload_bits.div_ceil(prim.capacity_bits);
-        let blocks_per_replica = geometry_blocks.max(capacity_blocks).max(1);
+        // Cheapest legal organization, as a total order that never depends on
+        // declaration order: fewest blocks, then the fewest wasted storage
+        // cells, then a port at least as wide as the requested word (so a word
+        // is not needlessly split across blocks), then the narrowest port, then
+        // the shallowest.
+        let mut best: Option<((u64, u64, u64, u64, u64), RamMode)> = None;
+        for mode in modes {
+            let width_slices = req.width_bits.div_ceil(mode.width_bits);
+            let depth_slices = req.depth.div_ceil(mode.depth);
+            let blocks = width_slices.saturating_mul(depth_slices).max(1);
+            let wasted = blocks
+                .saturating_mul(mode.cells())
+                .saturating_sub(payload_bits);
+            let splits_words = u64::from(mode.width_bits < req.width_bits);
+            let key = (blocks, wasted, splits_words, mode.width_bits, mode.depth);
+            if best.map(|(existing, _)| key < existing).unwrap_or(true) {
+                best = Some((key, mode));
+            }
+        }
+        let (_, mode) = best.ok_or_else(|| TargetError::UnsupportedBufferGeometry {
+            primitive: prim.name.clone(),
+            detail: "primitive declares no usable physical organization".into(),
+        })?;
+        let blocks_per_replica =
+            req.width_bits.div_ceil(mode.width_bits) * req.depth.div_ceil(mode.depth);
+        let width_padded_bits = req.width_bits.div_ceil(mode.width_bits) * mode.width_bits;
+        let depth_padded = req.depth.div_ceil(mode.depth) * mode.depth;
 
         let read_replicas = req.read_ports.div_ceil(prim.read_ports);
         let write_replicas = if prim.write_ports == 0 {
@@ -900,10 +1117,12 @@ impl Ti60Target {
 
         Ok(RamMapping {
             primitive: prim.name.clone(),
+            mode,
+            blocks_per_replica: Ram10Blocks(blocks_per_replica),
             blocks: Ram10Blocks(blocks_per_replica * replication),
             replication,
-            width_padded_bits: width_slices * prim.max_width_bits,
-            depth_padded: depth_slices * prim.max_depth,
+            width_padded_bits,
+            depth_padded,
             capacity_bits_used: payload_bits,
         })
     }
@@ -939,6 +1158,7 @@ impl Ti60Target {
                 int8xint8_per_dsp48: 2,
                 int9xint8_per_dsp48: 1,
                 requant_lane_dsp48: 1,
+                dsp_multiplier_operand_bits: 18,
             },
             logic: LogicSpec {
                 xlr_per_mac_lane: 0,
@@ -949,10 +1169,50 @@ impl Ti60Target {
                 primitive: vec![RamPrimitive {
                     name: "ram10".into(),
                     capacity_bits: 10_240,
-                    max_width_bits: 40,
-                    max_depth: 1024,
+                    max_width_bits: 20,
+                    max_depth: 8192,
                     read_ports: 1,
                     write_ports: 1,
+                    // The organizations of the Efinix `EFX_RAM10`, verbatim
+                    // from `sim_models/verilog/efx_ram10.v`. The block is a
+                    // 10 Kbit simple dual port; these are *all* the width/depth
+                    // pairs its ports can take, so `40 × 256` — the rectangle a
+                    // naive `max_width × max_depth` would invent — does not
+                    // exist, and neither does a 40-bit port.
+                    mode: vec![
+                        RamMode {
+                            width_bits: 1,
+                            depth: 8192,
+                        },
+                        RamMode {
+                            width_bits: 2,
+                            depth: 4096,
+                        },
+                        RamMode {
+                            width_bits: 4,
+                            depth: 2048,
+                        },
+                        RamMode {
+                            width_bits: 5,
+                            depth: 2048,
+                        },
+                        RamMode {
+                            width_bits: 8,
+                            depth: 1024,
+                        },
+                        RamMode {
+                            width_bits: 10,
+                            depth: 1024,
+                        },
+                        RamMode {
+                            width_bits: 16,
+                            depth: 512,
+                        },
+                        RamMode {
+                            width_bits: 20,
+                            depth: 512,
+                        },
+                    ],
                 }],
             },
             stream: StreamSection {
@@ -1642,32 +1902,77 @@ mod tests {
     }
 
     #[test]
-    fn map_mac_dual_and_single() {
+    fn map_mac_dual_single_and_wide() {
         let t = reference();
         let dual = t.map_mac(8, 8, MacLanes(64)).unwrap();
         assert_eq!(dual.mode, MacMode::Int8MacDual);
         assert_eq!(dual.lanes_per_dsp48, 2);
+        assert_eq!(dual.multipliers_per_lane, 1);
         assert_eq!(dual.dsp48, DspBlocks(32));
 
         let single = t.map_mac(9, 8, MacLanes(64)).unwrap();
         assert_eq!(single.mode, MacMode::Int9MacSingle);
+        assert_eq!(single.multipliers_per_lane, 1);
         assert_eq!(single.dsp48, DspBlocks(64));
 
         let i4 = t.map_mac(8, 4, MacLanes(7)).unwrap();
         assert_eq!(i4.mode, MacMode::Int8MacDual);
         assert_eq!(i4.dsp48, DspBlocks(4));
 
+        // A ten-bit interval has no ten-bit multiplier: it needs two nine-bit
+        // partial products, and the DSP cost doubles with it.
+        let wide = t.map_mac(10, 8, MacLanes(64)).unwrap();
+        assert_eq!(wide.mode, MacMode::Int9MacSingle);
+        assert_eq!(wide.multipliers_per_lane, 2);
+        assert_eq!(wide.dsp48, DspBlocks(128));
+        assert_eq!(
+            t.map_mac(18, 8, MacLanes(1)).unwrap().multipliers_per_lane,
+            2
+        );
+
         assert!(matches!(
-            t.map_mac(16, 8, MacLanes(4)),
+            t.map_mac(19, 8, MacLanes(4)),
+            Err(TargetError::UnsupportedOperandWidth { .. })
+        ));
+        assert!(matches!(
+            t.map_mac(0, 8, MacLanes(4)),
             Err(TargetError::UnsupportedOperandWidth { .. })
         ));
     }
 
+    /// The requantization multiplier is `|acc| × M0`, and the DSP48's
+    /// multiplier only takes an 18-bit operand: a wider accumulator is
+    /// decomposed into cascaded partial products, one DSP48 each. The measured
+    /// Ti60 requant unit (`engine/out_leaf_rq/requant_unit.map.v`) maps a
+    /// 32-bit accumulator against an 18-bit `M0` to exactly two `EFX_DSP48`,
+    /// so a 32-bit plan may never be told its requant unit costs one block.
     #[test]
-    fn map_buffer_rounds_width_depth_and_ports() {
+    fn map_requant_decomposes_a_wide_accumulator_per_18_bit_chunk() {
         let t = reference();
-        // 64 bits x 100 words on a 40x1024 primitive -> 2 width slices, 1 depth
-        // slice, and 1 replica by payload.
+        assert_eq!(t.map_requant(MacLanes(1), 8), DspBlocks(1));
+        assert_eq!(t.map_requant(MacLanes(1), 18), DspBlocks(1));
+        assert_eq!(t.map_requant(MacLanes(1), 19), DspBlocks(2));
+        assert_eq!(
+            t.map_requant(MacLanes(1), 32),
+            DspBlocks(2),
+            "the measured 32x18 requant unit is two cascaded EFX_DSP48"
+        );
+        assert_eq!(t.map_requant(MacLanes(4), 32), DspBlocks(8));
+
+        // A target that declares no multiplier operand width defaults to the
+        // EFX_DSP48's 18 bits rather than to one block per lane.
+        let mut defaulted = reference();
+        defaulted.mac.dsp_multiplier_operand_bits = 0;
+        assert!(defaulted.validate().is_err());
+    }
+
+    #[test]
+    fn map_buffer_tiles_with_legal_organizations() {
+        let t = reference();
+        let declared = t.ram.primitive[0].mode.clone();
+        // 64 bits x 100 words: the cheapest real organization is 16x512, four
+        // width slices and one depth slice. 20x512 also needs four blocks but
+        // wastes more of each block, and no 40-bit organization exists.
         let m = t
             .map_buffer(
                 "ram10",
@@ -1679,12 +1984,18 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(m.width_padded_bits, 80);
-        assert_eq!(m.depth_padded, 1024);
+        assert_eq!(m.mode.width_bits, 16);
+        assert_eq!(m.mode.depth, 512);
+        assert!(declared.contains(&m.mode));
+        assert_eq!(m.width_padded_bits, 64);
+        assert_eq!(m.depth_padded, 512);
+        assert_eq!(m.blocks_per_replica, Ram10Blocks(4));
         assert_eq!(m.replication, 1);
-        assert_eq!(m.blocks, Ram10Blocks(2));
+        assert_eq!(m.blocks, Ram10Blocks(4));
 
-        // Two simultaneous reads duplicate the block.
+        // 8 bits x 512 words fits one block, and the narrowest fitting
+        // organization is the 8-bit-wide one — an 8-bit code never has to be
+        // padded to a wider port.
         let m2 = t
             .map_buffer(
                 "ram10",
@@ -1696,10 +2007,31 @@ mod tests {
                 },
             )
             .unwrap();
+        assert_eq!(m2.mode.width_bits, 8);
+        assert_eq!(m2.mode.depth, 1024);
+        assert_eq!(m2.blocks_per_replica, Ram10Blocks(1));
         assert_eq!(m2.replication, 2);
         assert_eq!(m2.blocks, Ram10Blocks(2));
 
-        // Capacity dominates when depth exceeds one block.
+        // 50 144 weight codes — the ink_dw weight blob at one code per entry —
+        // need 49 blocks of the 8-bit-wide organization, not one per layer.
+        let weights = t
+            .map_buffer(
+                "ram10",
+                BufferRequest {
+                    width_bits: 8,
+                    depth: 50_144,
+                    read_ports: 1,
+                    write_ports: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(weights.mode.width_bits, 8);
+        assert_eq!(weights.mode.depth, 1024);
+        assert_eq!(weights.blocks, Ram10Blocks(49));
+
+        // 8 bits x 2048 words needs two blocks in the same organization, with
+        // no wasted depth at all.
         let m3 = t
             .map_buffer(
                 "ram10",
@@ -1711,6 +2043,8 @@ mod tests {
                 },
             )
             .unwrap();
+        assert_eq!(m3.mode.width_bits, 8);
+        assert_eq!(m3.depth_padded, 2048);
         assert_eq!(m3.blocks, Ram10Blocks(2));
 
         // Zero request is rejected.
@@ -1726,6 +2060,88 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// The bug this guards: `max_width × max_depth` is 40 960 bits on a
+    /// 10 240-bit block. A 40-bit-wide, 1024-deep buffer must therefore cost
+    /// four blocks, not one, and no reported padding may claim a 40x1024 block.
+    #[test]
+    fn map_buffer_never_claims_a_geometry_wider_than_one_block_holds() {
+        let t = reference();
+        let prim = t.default_ram_primitive().unwrap();
+        let m = t
+            .map_buffer(
+                "ram10",
+                BufferRequest {
+                    width_bits: 40,
+                    depth: 1024,
+                    read_ports: 1,
+                    write_ports: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(m.blocks, Ram10Blocks(4));
+        assert!(
+            m.mode.cells() <= prim.capacity_bits,
+            "the selected organization {}x{} holds {} bits, above the block capacity {}",
+            m.mode.width_bits,
+            m.mode.depth,
+            m.mode.cells(),
+            prim.capacity_bits
+        );
+        assert!(m.capacity_bits_used <= m.blocks_per_replica.get() * prim.capacity_bits);
+        assert_eq!(m.width_padded_bits, 40);
+        assert_eq!(m.depth_padded, 1024);
+    }
+
+    #[test]
+    fn declared_ram_modes_must_fit_one_block() {
+        // A 40x1024 organization is four blocks' worth of bits: rejected.
+        let mut t = reference();
+        t.ram.primitive[0].mode.push(RamMode {
+            width_bits: 40,
+            depth: 1024,
+        });
+        assert!(matches!(
+            t.validate(),
+            Err(TargetError::InvalidValue { .. })
+        ));
+
+        // So is an organization wider than the primitive's declared maximum.
+        let mut t = reference();
+        t.ram.primitive[0].mode.push(RamMode {
+            width_bits: 80,
+            depth: 128,
+        });
+        assert!(t.validate().is_err());
+
+        // A zero-width organization is not an organization.
+        let mut t = reference();
+        t.ram.primitive[0].mode.push(RamMode {
+            width_bits: 0,
+            depth: 10,
+        });
+        assert!(t.validate().is_err());
+    }
+
+    /// Without declared modes the fallback is a *conservative single
+    /// rectangle*, never the product of the two independent maxima.
+    #[test]
+    fn undeclared_modes_fall_back_to_a_capacity_consistent_rectangle() {
+        let mut t = reference();
+        let declared = t.ram.primitive[0].mode.clone();
+        t.ram.primitive[0].mode.clear();
+        let modes = t.ram.primitive[0].effective_modes();
+        assert_eq!(modes.len(), 1);
+        assert_eq!(modes[0].width_bits, 20);
+        assert_eq!(modes[0].depth, 512);
+        assert!(
+            declared.contains(&modes[0]),
+            "the fallback must be a real EFX_RAM10 organization, not {}x{}",
+            modes[0].width_bits,
+            modes[0].depth
+        );
+        t.validate().unwrap();
     }
 
     #[test]
@@ -1747,6 +2163,20 @@ mod tests {
             t.validate(),
             Err(TargetError::ReservationOverBudget { .. })
         ));
+    }
+
+    /// The checked-in fixture and the built-in reference must be the same
+    /// target: everything else (the CLI, the acceptance suite, the emit policy)
+    /// loads the file, while the tests and the RTL examples compare against the
+    /// reference, so a drift between them would silently change what a plan is
+    /// judged on.
+    #[test]
+    fn the_checked_in_target_fixture_is_the_reference_target() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/targets/ti60f225.toml");
+        let t = Ti60Target::from_toml_file(&path)
+            .unwrap_or_else(|e| panic!("loading {}: {e}", path.display()));
+        assert_eq!(t, reference());
     }
 
     #[test]
@@ -1777,6 +2207,7 @@ xlr = 20_232
 int8xint8_per_dsp48 = 2
 int9xint8_per_dsp48 = 1
 requant_lane_dsp48 = 1
+dsp_multiplier_operand_bits = 18
 
 [logic]
 xlr_per_engine = 2_500
@@ -1784,10 +2215,42 @@ xlr_per_engine = 2_500
 [[ram.primitive]]
 name = "ram10"
 capacity_bits = 10_240
-max_width_bits = 40
-max_depth = 1024
+max_width_bits = 20
+max_depth = 8192
 read_ports = 1
 write_ports = 1
+
+[[ram.primitive.mode]]
+width_bits = 1
+depth = 8192
+
+[[ram.primitive.mode]]
+width_bits = 2
+depth = 4096
+
+[[ram.primitive.mode]]
+width_bits = 4
+depth = 2048
+
+[[ram.primitive.mode]]
+width_bits = 5
+depth = 2048
+
+[[ram.primitive.mode]]
+width_bits = 8
+depth = 1024
+
+[[ram.primitive.mode]]
+width_bits = 10
+depth = 1024
+
+[[ram.primitive.mode]]
+width_bits = 16
+depth = 512
+
+[[ram.primitive.mode]]
+width_bits = 20
+depth = 512
 
 [[stream.primitive]]
 name = "efx_dsp48"

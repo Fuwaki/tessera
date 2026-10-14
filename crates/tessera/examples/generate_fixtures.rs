@@ -14,7 +14,8 @@ use std::path::PathBuf;
 
 use tessera::layout::{
     Activation, ActivationKind, ElemType, ExecutionMode, FusionBoundary, FusionKind, Granularity,
-    ObjectiveSpec, ObjectiveTerm, OpKind, Requant, Rounding, TensorId, TensorShape,
+    MemoryPlacement, ObjectiveSpec, ObjectiveTerm, OpKind, Requant, Rounding, TensorId,
+    TensorShape,
 };
 use tessera::planner::{
     ConvDetail, Hints, MemoryPolicy, OpDetail, PlanInput, Policy, PolicyConstraints, PrimitiveOp,
@@ -42,6 +43,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write(
         &fixtures.join("policies/explore.toml"),
         &explore_policy().to_toml_string()?,
+    )?;
+    write(
+        &fixtures.join("policies/emit.toml"),
+        &emit_policy().to_toml_string()?,
     )?;
 
     write(&fixtures.join("w8/manifest.json"), W8_MANIFEST)?;
@@ -126,6 +131,38 @@ fn explore_policy() -> Policy {
     policy.search.granularities = vec![Granularity::Row, Granularity::Tile, Granularity::Frame];
     policy.search.tile_widths = vec![16, 32, 64];
     policy.search.tile_heights = vec![16, 32, 48];
+    policy
+}
+
+/// Policy shaped to the emitted backend envelope: one shared MAC array of at most
+/// 64 multipliers (`simd * pe <= 64`, expressed as per-factor caps because the
+/// policy schema has no product constraint) over a whole-frame activation arena,
+/// which is what the emitted FSM instantiates. The generic `streaming`/`explore`
+/// policies stay unconstrained on purpose, so the difference between "the
+/// planner's best plan" and "a plan the backend can emit" stays visible.
+fn emit_policy() -> Policy {
+    let mut policy = explore_policy();
+    // The full-graph backend emits one static-schedule engine over an on-chip
+    // arena, so the plan it consumes must be a shared-tile frame schedule; it
+    // refuses a streaming- or dedicated-labelled plan by name instead of
+    // relabelling it.
+    policy.search.execution_modes = vec![ExecutionMode::SharedTile];
+    policy.search.granularities = vec![Granularity::Frame];
+    // The emitted engine keeps every activation in one on-chip arena and reads it
+    // at computed addresses, so it instantiates no per-step line buffer: on-chip
+    // BRAM is the only placement that describes a structure this backend has.
+    policy.memory.placements = vec![MemoryPlacement::Bram];
+    let cap = |pattern: &str, pe: &[u32]| tessera::planner::OperatorOverride {
+        pattern: pattern.to_string(),
+        allowed_simd: vec![1, 2, 4, 8, 16],
+        allowed_pe: pe.to_vec(),
+        allowed_tap_parallel: vec![1],
+    };
+    policy.operator_override = vec![
+        cap("conv2d", &[1, 2, 3, 4]),
+        cap("depthwise_conv2d", &[1, 2, 4]),
+        cap("pointwise_conv2d", &[1, 2, 4]),
+    ];
     policy
 }
 
@@ -228,18 +265,21 @@ fn pointwise_input() -> PlanInput {
                 name: "x".to_string(),
                 shape: TensorShape::new(1, 4, 8, 8),
                 elem: ElemType::I8,
+                code_range: None,
             },
             TensorDesc {
                 id: TensorId(1),
                 name: "pw.w".to_string(),
                 shape: TensorShape::new(4, 4, 1, 1),
                 elem: ElemType::I8,
+                code_range: None,
             },
             TensorDesc {
                 id: TensorId(2),
                 name: "y".to_string(),
                 shape: TensorShape::new(1, 4, 8, 8),
                 elem: ElemType::I8,
+                code_range: None,
             },
         ],
         ops: vec![PrimitiveOp {
@@ -260,7 +300,7 @@ fn pointwise_input() -> PlanInput {
                 },
                 // 2^16 * 2^-18 = 0.25 exactly: a requantization the emitted
                 // fixed-point datapath reproduces bit-exactly.
-                requant: Requant::uniform(65_536, 18, Rounding::HalfUp, -128, 127),
+                requant: Requant::uniform(65_536, 18, Rounding::HalfAwayFromZero, -128, 127),
                 activation: Activation {
                     kind: ActivationKind::Relu,
                     clamp_lo: 0,

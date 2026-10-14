@@ -325,7 +325,14 @@ lower(plan) → RTL sources + memory images + metadata
 
 The backend MUST reject plans it cannot faithfully implement. It MUST NOT silently reinterpret unsupported placement, rounding, lane count, or memory protocol.
 
-Status at v0.1: the emitted backend (`tessera.pw_dot.i8i8.v1`) supports one streaming pointwise-dot step with signed int8 activations, ROM-resident weights, register/FIFO activation interfaces, no bias, and one half-up requantization contract inside the 17-bit multiplier field. Every other plan is rejected with the step name and the unsupported construct ([ADR-0003](docs/adr/0003-stream-interfaces-and-the-v1-rtl-envelope.md)); whole-model RTL is not yet implemented.
+Status at v0.1: the emitted backend supports a single streaming pointwise-dot step (signed int8
+activations, ROM-resident weights, register/FIFO activation interfaces, no bias) and whole models
+through a static-schedule FSM over a lifetime-reused activation arena with one shared MAC array.
+One requantization contract serves both: a 17-bit multiplier with **half-away-from-zero** rounding
+(`2^(shift-1)` offset for non-negative products, `2^(shift-1)-1` for negative ones). The exactness
+baseline is the compiled fixed-point IR, not the training `f32` coefficients, which are approximated
+with a per-step recorded bound. Every plan outside the envelope is rejected with the step name and
+the unsupported construct ([ADR-0003](docs/adr/0003-stream-interfaces-and-the-v1-rtl-envelope.md)).
 
 ## 8. Verification is a built-in feature
 

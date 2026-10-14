@@ -1,0 +1,410 @@
+{
+  "format": "tessera.graph",
+  "schema_version": 1,
+  "provenance": {
+    "source_format": "fpga_st_train.int8.v1",
+    "importer_version": "tessera-frontend/0.1.0",
+    "manifest_sha256": "4628e5f6516597fcaad61b79628a422808fd3f1b5195ac1d0d25ab7d07d8b983",
+    "weights_sha256": "dcea2d7cbf5be5d4dea1f94f7da5a8b43187332b2dd45e4edf5af2292e7a01fa",
+    "weight_file": "weights.bin",
+    "weight_bytes": 172
+  },
+  "graph": {
+    "source_format": "fpga_st_train.int8.v1",
+    "arch": "fixture-w8",
+    "quant": {
+      "bits": {
+        "acts": 8,
+        "weights": 8
+      },
+      "act_qmax": 127.0,
+      "output_qmax": 255.0,
+      "weight_qmax": 127.0,
+      "act_zero_point": 0,
+      "accumulator": "Int32",
+      "requant_rounding": "HalfAwayFromZero",
+      "packing": "I8x1"
+    },
+    "points": [
+      {
+        "id": 0,
+        "name": "image",
+        "scale": 0.007874016
+      },
+      {
+        "id": 1,
+        "name": "stem.in",
+        "scale": 0.014
+      },
+      {
+        "id": 2,
+        "name": "dw.in",
+        "scale": 0.02
+      },
+      {
+        "id": 3,
+        "name": "mid.in",
+        "scale": 0.03
+      }
+    ],
+    "ops": [
+      {
+        "Conv": {
+          "layer": "stem",
+          "in_point": 0,
+          "out_point": {
+            "Point": 1
+          }
+        }
+      },
+      {
+        "Relu": {
+          "layer": "stem"
+        }
+      },
+      {
+        "Conv": {
+          "layer": "dw",
+          "in_point": 1,
+          "out_point": {
+            "Point": 2
+          }
+        }
+      },
+      {
+        "Relu": {
+          "layer": "dw"
+        }
+      },
+      {
+        "Conv": {
+          "layer": "mid",
+          "in_point": 2,
+          "out_point": {
+            "Point": 3
+          }
+        }
+      },
+      {
+        "Relu": {
+          "layer": "mid"
+        }
+      },
+      {
+        "Add": {
+          "point": 3,
+          "source_point": 1,
+          "scale": 0.03
+        }
+      },
+      {
+        "UpsampleNearest2x": {
+          "point": 3
+        }
+      },
+      {
+        "Conv": {
+          "layer": "head",
+          "in_point": 3,
+          "out_point": "ImageSentinel"
+        }
+      },
+      {
+        "QuantizeU8Output": {
+          "scale": 0.003921569
+        }
+      }
+    ],
+    "layers": [
+      {
+        "id": 0,
+        "name": "stem",
+        "op": "Conv2dRelu",
+        "kind": "Conv2d",
+        "in_channels": 3,
+        "out_channels": 4,
+        "groups": 1,
+        "act_bits": 8,
+        "weight_bits": 8,
+        "act_zero_point": 0,
+        "out_relu": true,
+        "out_unsigned": false,
+        "kernel": {
+          "h": 3,
+          "w": 3
+        },
+        "stride": {
+          "h": 1,
+          "w": 1
+        },
+        "padding": {
+          "Reflect": 1
+        },
+        "in_point": 0,
+        "out_point": {
+          "Point": 1
+        },
+        "in_scale": 0.007874016,
+        "out_scale": 0.014,
+        "weight_scale": [
+          0.01,
+          0.02,
+          0.03,
+          0.04
+        ],
+        "bias": [
+          0.1,
+          -0.1,
+          0.2,
+          -0.2
+        ],
+        "bias_int32": [
+          10,
+          -10,
+          20,
+          -20
+        ],
+        "requant": [
+          0.0056,
+          0.011,
+          0.017,
+          0.022
+        ],
+        "weight_offset": 0,
+        "weight_count": 108,
+        "weight_byte_offset": 0,
+        "weight_bytes": 108
+      },
+      {
+        "id": 1,
+        "name": "dw",
+        "op": "DepthwiseConv2dRelu",
+        "kind": "DepthwiseConv2d",
+        "in_channels": 4,
+        "out_channels": 4,
+        "groups": 4,
+        "act_bits": 8,
+        "weight_bits": 8,
+        "act_zero_point": 0,
+        "out_relu": true,
+        "out_unsigned": false,
+        "kernel": {
+          "h": 3,
+          "w": 3
+        },
+        "stride": {
+          "h": 1,
+          "w": 1
+        },
+        "padding": {
+          "Reflect": 1
+        },
+        "in_point": 1,
+        "out_point": {
+          "Point": 2
+        },
+        "in_scale": 0.014,
+        "out_scale": 0.02,
+        "weight_scale": [
+          0.01,
+          0.02,
+          0.03,
+          0.04
+        ],
+        "bias": [
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "bias_int32": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "requant": [
+          0.01,
+          0.01,
+          0.01,
+          0.01
+        ],
+        "weight_offset": 108,
+        "weight_count": 36,
+        "weight_byte_offset": 108,
+        "weight_bytes": 36
+      },
+      {
+        "id": 2,
+        "name": "mid",
+        "op": "Conv2dRelu",
+        "kind": "PointwiseConv2d",
+        "in_channels": 4,
+        "out_channels": 4,
+        "groups": 1,
+        "act_bits": 8,
+        "weight_bits": 8,
+        "act_zero_point": 0,
+        "out_relu": true,
+        "out_unsigned": false,
+        "kernel": {
+          "h": 1,
+          "w": 1
+        },
+        "stride": {
+          "h": 1,
+          "w": 1
+        },
+        "padding": "None",
+        "in_point": 2,
+        "out_point": {
+          "Point": 3
+        },
+        "in_scale": 0.02,
+        "out_scale": 0.03,
+        "weight_scale": [
+          0.02,
+          0.02,
+          0.02,
+          0.02
+        ],
+        "bias": [
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "bias_int32": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "requant": [
+          0.01,
+          0.01,
+          0.01,
+          0.01
+        ],
+        "weight_offset": 144,
+        "weight_count": 16,
+        "weight_byte_offset": 144,
+        "weight_bytes": 16
+      },
+      {
+        "id": 3,
+        "name": "head",
+        "op": "Conv2d",
+        "kind": "PointwiseConv2d",
+        "in_channels": 4,
+        "out_channels": 3,
+        "groups": 1,
+        "act_bits": 8,
+        "weight_bits": 8,
+        "act_zero_point": 0,
+        "out_relu": false,
+        "out_unsigned": true,
+        "kernel": {
+          "h": 1,
+          "w": 1
+        },
+        "stride": {
+          "h": 1,
+          "w": 1
+        },
+        "padding": "None",
+        "in_point": 3,
+        "out_point": "ImageSentinel",
+        "in_scale": 0.03,
+        "out_scale": 0.003921569,
+        "weight_scale": [
+          0.02,
+          0.02,
+          0.02
+        ],
+        "bias": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "bias_int32": [
+          0,
+          0,
+          0
+        ],
+        "requant": [
+          0.1,
+          0.1,
+          0.1
+        ],
+        "weight_offset": 160,
+        "weight_count": 12,
+        "weight_byte_offset": 160,
+        "weight_bytes": 12
+      }
+    ],
+    "weight_stream": {
+      "file": "weights.bin",
+      "byte_len": 172,
+      "code_count": 172,
+      "packing": "I8x1"
+    },
+    "notes": [
+      "synthetic fixture generated by crates/tessera/examples/generate_fixtures.rs"
+    ]
+  },
+  "metrics": {
+    "point_count": 4,
+    "graph_op_count": 10,
+    "layer_count": 4,
+    "conv_layer_count": 1,
+    "depthwise_layer_count": 1,
+    "pointwise_layer_count": 2,
+    "relu_layer_count": 3,
+    "add_count": 1,
+    "upsample_count": 1,
+    "weight_codes": 172,
+    "weight_bytes": 172,
+    "macs_per_output_pixel": 172,
+    "per_layer": [
+      {
+        "name": "stem",
+        "macs_per_pixel": 108,
+        "weight_codes": 108
+      },
+      {
+        "name": "dw",
+        "macs_per_pixel": 36,
+        "weight_codes": 36
+      },
+      {
+        "name": "mid",
+        "macs_per_pixel": 16,
+        "weight_codes": 16
+      },
+      {
+        "name": "head",
+        "macs_per_pixel": 12,
+        "weight_codes": 12
+      }
+    ],
+    "point_fanout": [
+      {
+        "point": 0,
+        "consumers": 1
+      },
+      {
+        "point": 1,
+        "consumers": 2
+      },
+      {
+        "point": 2,
+        "consumers": 1
+      },
+      {
+        "point": 3,
+        "consumers": 3
+      }
+    ]
+  }
+}

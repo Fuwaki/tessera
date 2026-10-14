@@ -1,0 +1,43 @@
+# Acceptance policy with an impossible frame budget.
+#
+# `max_frame_cycles` scales the per-frame DDR allowance (rate * cycles / clock),
+# so one cycle buys 9 bytes of reads at 900 MB/s and 100 MHz, while the graph
+# input alone is 5x5x3 = 75 bytes: every candidate must be rejected on the read
+# budget. The run must produce an INFEASIBLE layout that explains itself, never
+# a panic and never a silently-repaired plan.
+format = "tessera.policy"
+schema_version = 1
+operator_override = []
+
+[constraints]
+allow_cpu_layer_dispatch = false
+max_frame_cycles = 1
+# Exact against the compiled fixed-point contract, not the training f32
+require_bit_exact = true
+
+[fusion]
+allow = []
+forbid = ["fanout_value", "cross_ddr_boundary"]
+
+[hint]
+prefer_bram_over_ddr = false
+prefer_fusion = false
+prefer_shared_engines = false
+
+[memory]
+allow_ping_pong = true
+max_ping_pong_buffers = 2
+placements = ["line_buffer", "bram", "ddr"]
+
+[objective]
+primary = "minimize_cycles"
+secondary = ["minimize_ddr_bytes"]
+
+[search]
+execution_modes = ["shared_tile", "streaming", "hybrid", "dedicated"]
+granularities = ["row", "tile", "frame"]
+max_candidates = 200000
+seed = 20261015
+tile_heights = [16, 32, 48]
+tile_widths = [16, 32, 64]
+utilisation_percent = 85

@@ -38,10 +38,13 @@ Implemented end to end:
 - **MLIR** (`src/mlir*.rs`) — deterministic tensor-level MLIR emission for the v1 operator subset, plus the pinned Melior 0.28.2 pass pipeline behind the optional `melior` feature.
 - **Lowering** (`src/lower.rs`) — Graph IR to the planner's typed primitive graph, including fixed-point requantization serialization that preserves per-output-channel multipliers.
 - **Planner** (`src/target.rs`, `src/planner.rs`, `src/layout.rs`) — Ti60 target model and layout search over execution mode, granularity, folding, fusion and memory placement, with rejected-candidate reporting and a validated `tessera.layout` artifact.
-- **RTL** (`src/rtl.rs`, `src/weights.rs`) — SystemVerilog emission for a single streaming pointwise-dot step, with a self-checking testbench and a Verilator simulation path. Unsupported plans are rejected by step name.
+- **RTL** (`src/rtl.rs`, `src/rtl/full.rs`, `src/weights.rs`) — SystemVerilog emission with a self-checking testbench and a Verilator simulation path, for two envelopes: a single streaming pointwise-dot step, and whole models through a static-schedule FSM over an activation arena with one shared MAC array. Anything outside both is rejected by step name.
 - **Verification** (`src/stages.rs`) — artifact detection, cross-stage provenance re-checks, and deterministic output checks.
 
-RTL for whole models is **not** implemented yet: the W8 example solves to a valid seven-step layout and is then rejected at `emit`, because the v1 kernel emits one pointwise step. DMA scheduling, synthesis reports and board measurement are open (see [concept book](docs/concept-book.md) §8 and §11).
+The W8 example solves to a valid seven-step shared-tile layout under
+`fixtures/policies/emit.toml`, then emits and simulates through the full-graph
+backend. Open work: DMA scheduling and frame overlap, synthesis reports and board
+measurement (see [concept book](docs/concept-book.md) §8 and §11).
 
 ## Quick start
 

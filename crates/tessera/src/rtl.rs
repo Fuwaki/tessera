@@ -26,7 +26,7 @@
 //!   valid/ready interface, and the output streamed into a `Register`/`Fifo`
 //!   buffer;
 //! * requantization in the `sts_rq` fx form: the step's scalar
-//!   `Requant { m0, shift, rounding: HalfUp, saturate_lo, saturate_hi }` is
+//!   `Requant { m0, shift, rounding: HalfAwayFromZero, saturate_lo, saturate_hi }` is
 //!   replicated across every output channel (the emitted ROM is per-channel),
 //!   intersected with the step's activation clamp, applied as
 //!   `((|acc| * m0) + 2^(shift-1)) >> shift` with the accumulator sign
@@ -38,7 +38,8 @@
 //! Every other operator (depthwise, 2D convolution with any kernel other than
 //! 1x1, add, standalone requant/activation, nearest upsample, unsigned output
 //! quantization), i4/u8/i32/f32 *activation* element types, asymmetric
-//! quantization, `m0` outside the 17-bit field range `[0, 2^17)`, rounding other than half-up,
+//! quantization, `m0` outside the 17-bit field range `[0, 2^17)`, rounding other than
+//! half-away-from-zero,
 //! missing requantization, bias terms, tap parallelism, shared-tile or hybrid
 //! execution modes, `Bram`/`Ddr`/`LineBuffer` activation buffers, weights that
 //! are not ROM-resident, and plans with zero or more than one schedule step.
@@ -88,6 +89,9 @@ use crate::layout::{
     ActivationKind, ElemType as LayoutElemType, ExecutionMode, ExecutionPlan, MemoryPlacement,
     OpKind, Rounding, TensorRef,
 };
+
+pub mod full;
+pub mod reference;
 
 /// Format tag stamped into the serialized RTL bundle metadata.
 pub const RTL_BUNDLE_FORMAT: &str = "tessera.rtl_bundle";
@@ -326,6 +330,10 @@ impl fmt::Display for PlannedOp {
 #[serde(rename_all = "snake_case")]
 pub enum ElementType {
     I8,
+    /// Signed 9-bit value (an unclamped residual sum of two i8 codes).
+    I9,
+    /// Signed 16-bit transport container.
+    I16,
     I4,
     U8,
     I32,
@@ -336,6 +344,8 @@ impl From<LayoutElemType> for ElementType {
     fn from(value: LayoutElemType) -> Self {
         match value {
             LayoutElemType::I8 => ElementType::I8,
+            LayoutElemType::I9 => ElementType::I9,
+            LayoutElemType::I16 => ElementType::I16,
             LayoutElemType::I4 => ElementType::I4,
             LayoutElemType::U8 => ElementType::U8,
             LayoutElemType::I32 => ElementType::I32,
@@ -348,6 +358,8 @@ impl fmt::Display for ElementType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             ElementType::I8 => "i8",
+            ElementType::I9 => "i9",
+            ElementType::I16 => "i16",
             ElementType::I4 => "i4",
             ElementType::U8 => "u8",
             ElementType::I32 => "i32",
@@ -1211,6 +1223,11 @@ pub struct RtlMetadata {
     /// Exact commands that reproduce and verify this bundle.
     pub reproduce: Vec<String>,
     pub bundle_digest: String,
+    /// Present only for the full-graph backend: the generated structure, its
+    /// exact activation arena, MAC lane count and cycle accounting, next to the
+    /// plan's estimates. `None` for the single-kernel pointwise envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_graph: Option<full::FullGraphSummary>,
 }
 
 /// The emitted artifact bundle: sources plus metadata.
@@ -1474,6 +1491,7 @@ impl SystemVerilogBackend {
                 "verify: the testbench prints TESSA_RTL_PASS with mismatches=0".to_string(),
             ],
             bundle_digest,
+            full_graph: None,
         };
 
         let metadata_json =
@@ -1511,7 +1529,7 @@ fn unsupported_summary() -> Vec<String> {
         "activation or output element types other than signed i8".to_string(),
         "asymmetric quantization (non-zero activation or weight zero-points)".to_string(),
         "requantization without a normalized M0 in [2^16, 2^17), or with rounding other than \
-         half-up"
+         half-away-from-zero"
             .to_string(),
         "bias terms".to_string(),
         "kernel tap parallelism (tap_parallel != 1)".to_string(),
@@ -1848,11 +1866,12 @@ fn map_requant_channels(
              one"
         ),
     })?;
-    if requant.rounding != Rounding::HalfUp {
+    if requant.rounding != Rounding::HalfAwayFromZero {
         return Err(RtlError::UnsupportedQuantization {
             layer: layer.to_string(),
             detail: format!(
-                "rounding {:?} is not reproducible by the generated datapath; supported: HalfUp",
+                "rounding {:?} is not reproducible by the generated datapath; supported: \
+                 HalfAwayFromZero",
                 requant.rounding
             ),
         });
@@ -2903,6 +2922,8 @@ mod tests {
             .map(|(index, placement)| crate::layout::BufferBinding {
                 name: format!("buf{index}"),
                 placement,
+                region: crate::layout::BufferRegion::Stream,
+                base_offset_bytes: 0,
                 tensor: None,
                 width_bits: 8,
                 depth: 64,
@@ -2947,12 +2968,17 @@ mod tests {
                     ("graph_schema_version".to_string(), "1".to_string()),
                 ]),
             },
+            certainty: crate::layout::PlanCertainty::BestEffort,
             execution_mode: ExecutionMode::Streaming,
             engine: EngineConfig {
                 name: "stream_conv0".to_string(),
                 simd: 2,
                 pe: 2,
                 tap_parallel: 1,
+                activation_bits: 8,
+                accumulator_bits: 32,
+                weight_bits: 8,
+                arena_words: 0,
             },
             tile: None,
             steps: vec![ScheduleStep {
@@ -2972,10 +2998,14 @@ mod tests {
                 kernel: [1, 1],
                 groups: 1,
                 stride: [1, 1],
+                padding: None,
+                upsample_scale: None,
+                in_code_range: None,
+                out_code_range: None,
                 requant: Some(Requant::uniform(
                     (1 << 16) + 4096,
                     18,
-                    Rounding::HalfUp,
+                    Rounding::HalfAwayFromZero,
                     -128,
                     127,
                 )),
@@ -2987,11 +3017,25 @@ mod tests {
                 input_buffer: "buf0".to_string(),
                 output_buffer: "buf1".to_string(),
                 estimated_cycles: 12_345,
+                cost: crate::layout::StepCost {
+                    lanes: 4,
+                    lane_iterations: 12_345,
+                    macs: 12_345 * 4,
+                    setup_cycles: 0,
+                    utilisation_percent: 100,
+                },
                 fused_with: vec![],
             }],
             buffers,
             tensors: vec![weight_ref.clone()],
             weights: vec![weight_ref],
+            cycles: crate::layout::CycleBreakdown {
+                utilisation_percent: 100,
+                mac_cycles: 12_345,
+                setup_cycles: 0,
+                dma_cycles: 0,
+                total_cycles: 12_345,
+            },
             resources: ResourceEstimate::ZERO,
         }
     }
@@ -3350,7 +3394,13 @@ mod tests {
 
         // Multiplier that does not fit the 17-bit field.
         let mut plan = sample_execution_plan();
-        plan.steps[0].requant = Some(Requant::uniform(1 << 17, 3, Rounding::HalfUp, -128, 127));
+        plan.steps[0].requant = Some(Requant::uniform(
+            1 << 17,
+            3,
+            Rounding::HalfAwayFromZero,
+            -128,
+            127,
+        ));
         let err = SystemVerilogBackend
             .lower_execution_plan(&plan, &weights, &RtlConfig::default())
             .expect_err("out-of-range m0 must be rejected");
@@ -3358,7 +3408,13 @@ mod tests {
 
         // A small (denormalized) multiplier is representable, so it lowers.
         let mut plan = sample_execution_plan();
-        plan.steps[0].requant = Some(Requant::uniform(5, 3, Rounding::HalfUp, -128, 127));
+        plan.steps[0].requant = Some(Requant::uniform(
+            5,
+            3,
+            Rounding::HalfAwayFromZero,
+            -128,
+            127,
+        ));
         let bundle = SystemVerilogBackend
             .lower_execution_plan(&plan, &weights, &RtlConfig::default())
             .expect("denormalized m0 is representable");

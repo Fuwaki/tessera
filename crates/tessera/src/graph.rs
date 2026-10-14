@@ -15,6 +15,11 @@
 //!   [`QuantContract`] plus per-layer [`Layer::requant`] and `bias_int32`;
 //! * the output image is a distinct tensor from the internal points, represented by
 //!   [`PointRef::ImageSentinel`] rather than by an out-of-range integer;
+//! * newtype invariants (non-zero channels, group counts, kernel/stride/padding
+//!   extents, supported bit widths, finite positive scales and qmaxes, the symmetric
+//!   zero point, positive requantization coefficients) are enforced by the validating
+//!   constructors *and* by the `serde` path, so a tampered artifact fails as a typed
+//!   error instead of reaching arithmetic with an out-of-range value;
 //! * invalid states are rejected by [`Graph::validate`], which is run by the frontend
 //!   on import and by [`GraphArtifact::validate`] on load.
 
@@ -214,6 +219,9 @@ pub enum GraphError {
         declared: usize,
         actual: usize,
     },
+    UnsafeWeightPath {
+        file: String,
+    },
     ShapeChannelMismatch {
         point: u32,
         expected: u32,
@@ -284,18 +292,32 @@ impl fmt::Display for GraphError {
                 "unsupported weight packing {packing:?} for {weight_bits}-bit weights"
             ),
             GraphError::ZeroDimension { layer, what, value } => {
-                write!(f, "layer {layer}: {what} must be non-zero, found {value}")
+                if layer.is_empty() {
+                    write!(f, "{what} must be non-zero, found {value}")
+                } else {
+                    write!(f, "layer {layer}: {what} must be non-zero, found {value}")
+                }
             }
             GraphError::BadGroups {
                 layer,
                 groups,
                 in_channels,
                 out_channels,
-            } => write!(
-                f,
-                "layer {layer}: groups {groups} must be >= 1 and divide \
-                 in_channels {in_channels} and out_channels {out_channels}"
-            ),
+            } => {
+                if layer.is_empty() {
+                    write!(
+                        f,
+                        "groups {groups} must be >= 1 and divide in_channels {in_channels} \
+                         and out_channels {out_channels}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "layer {layer}: groups {groups} must be >= 1 and divide \
+                         in_channels {in_channels} and out_channels {out_channels}"
+                    )
+                }
+            }
             GraphError::KernelShape { layer, detail } => {
                 write!(f, "layer {layer}: {detail}")
             }
@@ -491,6 +513,11 @@ impl fmt::Display for GraphError {
                 f,
                 "weight file {file} is {actual} bytes but the manifest declares {declared}"
             ),
+            GraphError::UnsafeWeightPath { file } => write!(
+                f,
+                "weight file {file:?} must be a plain relative name inside the artifact \
+                 directory: no root, no prefix and no \"..\" component"
+            ),
             GraphError::ShapeChannelMismatch {
                 point,
                 expected,
@@ -624,9 +651,19 @@ impl fmt::Display for PointName {
 }
 
 /// Quantized element count along one axis; always non-zero.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Channels(u32);
+
+impl<'de> Deserialize<'de> for Channels {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = u32::deserialize(deserializer)?;
+        Channels::try_new(value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl Channels {
     /// Crate-internal constructor for values already proven non-zero at the boundary.
@@ -656,9 +693,19 @@ impl From<Channels> for u32 {
 }
 
 /// A spatial, kernel or padding extent; always non-zero.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Extent(u32);
+
+impl<'de> Deserialize<'de> for Extent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = u32::deserialize(deserializer)?;
+        Extent::try_new(value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl Extent {
     pub fn try_new(value: u32) -> GResult<Self> {
@@ -683,9 +730,19 @@ impl From<Extent> for u32 {
 }
 
 /// Convolution group count; always >= 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct GroupCount(u32);
+
+impl<'de> Deserialize<'de> for GroupCount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = u32::deserialize(deserializer)?;
+        GroupCount::try_new(value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl GroupCount {
     /// Crate-internal constructor for values already proven non-zero at the boundary.
@@ -715,9 +772,19 @@ impl From<GroupCount> for u32 {
 }
 
 /// A supported integer bit width for activations or weights.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct BitWidth(u8);
+
+impl<'de> Deserialize<'de> for BitWidth {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = u8::deserialize(deserializer)?;
+        BitWidth::try_new("declared", value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl BitWidth {
     pub fn try_new(what: &'static str, bits: u8) -> GResult<Self> {
@@ -753,9 +820,19 @@ pub struct Bits {
 }
 
 /// A finite, positive scale factor (real units per code).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct Scale(f32);
+
+impl<'de> Deserialize<'de> for Scale {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = f32::deserialize(deserializer)?;
+        Scale::try_new("declared scale", value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl Scale {
     pub fn try_new(what: &'static str, value: f32) -> GResult<Self> {
@@ -773,9 +850,19 @@ impl Scale {
 }
 
 /// A finite, positive saturation limit expressed as an integer code magnitude.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct QMax(f32);
+
+impl<'de> Deserialize<'de> for QMax {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = f32::deserialize(deserializer)?;
+        QMax::try_new("declared qmax", value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl QMax {
     pub fn try_new(what: &'static str, value: f32) -> GResult<Self> {
@@ -793,9 +880,25 @@ impl QMax {
 }
 
 /// Activation zero point. The supported scheme is symmetric, so this is always 0.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ZeroPoint(i32);
+
+impl<'de> Deserialize<'de> for ZeroPoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = i32::deserialize(deserializer)?;
+        if value != 0 {
+            return Err(serde::de::Error::custom(GraphError::NonZeroZeroPoint {
+                layer: "graph".to_owned(),
+                value,
+            }));
+        }
+        Ok(ZeroPoint(0))
+    }
+}
 
 impl ZeroPoint {
     pub fn symmetric() -> Self {
@@ -1008,10 +1111,25 @@ impl GraphOp {
 // ---------------------------------------------------------------------------
 
 /// Convolution kernel geometry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct Kernel {
     pub h: Extent,
     pub w: Extent,
+}
+
+impl<'de> Deserialize<'de> for Kernel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            h: u32,
+            w: u32,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Kernel::try_new(raw.h, raw.w).map_err(serde::de::Error::custom)
+    }
 }
 
 impl Kernel {
@@ -1038,10 +1156,25 @@ impl Kernel {
 }
 
 /// Convolution stride geometry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct Stride {
     pub h: Extent,
     pub w: Extent,
+}
+
+impl<'de> Deserialize<'de> for Stride {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            h: u32,
+            w: u32,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Stride::try_new(raw.h, raw.w).map_err(serde::de::Error::custom)
+    }
 }
 
 impl Stride {
@@ -1072,13 +1205,33 @@ impl Stride {
 /// The manifest uses reflection padding; it is preserved explicitly rather than being
 /// normalized away, because the border semantics of zero padding and reflection
 /// padding differ and the RTL backend must be able to reject the wrong mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum Padding {
     None,
     /// Reflect border padding of the given amount on all four sides.
     Reflect(Extent),
     /// Zero padding of the given amount on all four sides.
     Zero(Extent),
+}
+
+impl<'de> Deserialize<'de> for Padding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Wire shape of [`Padding`]: the payload is the raw amount.
+        #[derive(Deserialize)]
+        enum Raw {
+            None,
+            Reflect(u32),
+            Zero(u32),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::None => Ok(Padding::None),
+            Raw::Reflect(amount) => Padding::reflect(amount).map_err(serde::de::Error::custom),
+            Raw::Zero(amount) => Padding::zero(amount).map_err(serde::de::Error::custom),
+        }
+    }
 }
 
 impl Padding {
@@ -1119,9 +1272,19 @@ impl Padding {
 // ---------------------------------------------------------------------------
 
 /// Per-output-channel requantization coefficients: `out_code = round(acc * r)`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct RequantCoefficients(Vec<f32>);
+
+impl<'de> Deserialize<'de> for RequantCoefficients {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let values = Vec::<f32>::deserialize(deserializer)?;
+        RequantCoefficients::try_new(values).map_err(serde::de::Error::custom)
+    }
+}
 
 impl RequantCoefficients {
     pub fn try_new(values: Vec<f32>) -> GResult<Self> {
@@ -1260,6 +1423,10 @@ impl QuantContract {
         self.packing.codes_per_byte()
     }
     fn check(&self) -> GResult<()> {
+        // Every qmax below is derived from the widths, so re-check the supported range
+        // here: an out-of-range width would underflow `signed_qmax`.
+        BitWidth::try_new("acts", self.bits.acts.get())?;
+        BitWidth::try_new("weights", self.bits.weights.get())?;
         let expected_act = self.bits.acts.signed_qmax() as f32;
         if qmax_eq(self.act_qmax.get(), expected_act) == false {
             return Err(GraphError::QmaxMismatch {
@@ -1618,6 +1785,11 @@ impl Graph {
                 value: point_count,
             });
         }
+        // Re-check the scalar invariants that the constructors enforce, so a graph
+        // assembled or deserialized outside them still fails as a typed error instead of
+        // computing with an out-of-range value. The contract validates its own widths
+        // before deriving qmaxes from them.
+        check_weight_file(&self.weight_stream.file)?;
         self.quant.check()?;
 
         for (index, point) in self.points.iter().enumerate() {
@@ -1685,6 +1857,31 @@ impl Graph {
                 in_channels,
                 out_channels,
             });
+        }
+        // The geometry extents are non-zero by construction; re-check them here because
+        // a zero stride would divide by zero in shape inference and lowering.
+        for (what, value) in [
+            ("kernel height", layer.kernel.h.get()),
+            ("kernel width", layer.kernel.w.get()),
+            ("stride height", layer.stride.h.get()),
+            ("stride width", layer.stride.w.get()),
+        ] {
+            if value == 0 {
+                return Err(GraphError::ZeroDimension {
+                    layer: name.clone(),
+                    what,
+                    value: value as usize,
+                });
+            }
+        }
+        if let Some(amount) = layer.padding.amount() {
+            if amount.get() == 0 {
+                return Err(GraphError::ZeroDimension {
+                    layer: name.clone(),
+                    what: "padding",
+                    value: 0,
+                });
+            }
         }
         if layer.act_bits != self.quant.bits.acts {
             return Err(GraphError::InvalidBitWidth {
@@ -1800,6 +1997,14 @@ impl Graph {
             if !value.is_finite() {
                 return Err(GraphError::NonFinite {
                     what: format!("{name} bias"),
+                    value: *value,
+                });
+            }
+        }
+        for value in layer.requant.values() {
+            if !value.is_finite() || *value <= 0.0 {
+                return Err(GraphError::NonFinite {
+                    what: format!("{name} requant coefficient"),
                     value: *value,
                 });
             }
@@ -2100,8 +2305,9 @@ impl Graph {
         let mut ops = GraphOpCounts::default();
         for op in &self.ops {
             match op.kind() {
-                GraphOpKind::Conv => {}
-                GraphOpKind::Relu => ops.relu += 1,
+                // Convolutions are counted per layer and relu markers mirror the fused
+                // activation of a layer, so neither is a separate op metric.
+                GraphOpKind::Conv | GraphOpKind::Relu => {}
                 GraphOpKind::Add => ops.add += 1,
                 GraphOpKind::UpsampleNearest2x => ops.upsample += 1,
                 GraphOpKind::QuantizeU8Output => {}
@@ -2163,7 +2369,7 @@ impl Graph {
                 .iter()
                 .filter(|l| l.kind == LayerKind::PointwiseConv2d)
                 .count(),
-            relu_layer_count: ops.relu,
+            relu_layer_count: self.layers.iter().filter(|l| l.out_relu).count(),
             add_count: ops.add,
             upsample_count: ops.upsample,
             weight_codes,
@@ -2370,9 +2576,31 @@ impl Graph {
 
 #[derive(Default)]
 struct GraphOpCounts {
-    relu: usize,
     add: usize,
     upsample: usize,
+}
+
+/// A weight-blob reference must stay inside the directory it is resolved against:
+/// a plain relative name with no root, prefix or `..` component.
+pub(crate) fn check_weight_file(file: &str) -> GResult<()> {
+    let mut has_name = false;
+    for component in std::path::Path::new(file).components() {
+        match component {
+            std::path::Component::Normal(_) => has_name = true,
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(GraphError::UnsafeWeightPath {
+                    file: file.to_owned(),
+                });
+            }
+        }
+    }
+    if !has_name {
+        return Err(GraphError::UnsafeWeightPath {
+            file: file.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn describe_point_ref(point: PointRef) -> String {
@@ -2447,6 +2675,9 @@ impl GraphArtifact {
                 declared: self.schema_version,
             });
         }
+        // Consumers stage and read the weight blob relative to the artifact directory, so
+        // a tampered provenance must not be able to point outside it.
+        check_weight_file(&self.provenance.weight_file)?;
         self.graph.validate()?;
         if self.metrics != self.graph.metrics() {
             return Err(GraphError::MetricsStale);
@@ -2472,6 +2703,7 @@ impl GraphArtifact {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn ch(value: u32) -> Channels {
         Channels(value)
@@ -3005,5 +3237,278 @@ mod tests {
         assert_eq!(Padding::reflect(2).unwrap().amount(), Some(ext(2)));
         assert!(!Padding::zero(1).unwrap().is_reflect());
         assert!(Padding::reflect(0).is_err());
+    }
+
+    /// The example artifact as a JSON tree, for surgical tampering.
+    fn artifact_value() -> serde_json::Value {
+        let artifact = GraphArtifact::new(example_graph(), provenance(&example_graph())).unwrap();
+        serde_json::to_value(&artifact).unwrap()
+    }
+
+    fn reparse(value: &serde_json::Value) -> Result<GraphArtifact, serde_json::Error> {
+        serde_json::from_value(value.clone())
+    }
+
+    #[test]
+    fn artifact_deserialization_rejects_an_out_of_range_bit_width() {
+        // A zero width would underflow `signed_qmax`; an oversized one is not supported.
+        for bits in [0, 1, 17, 255] {
+            let mut value = artifact_value();
+            value["graph"]["quant"]["bits"]["acts"] = json!(bits);
+            let error = reparse(&value).unwrap_err();
+            assert!(
+                error.to_string().contains(&format!("bit width {bits}")),
+                "unexpected error for {bits} bits: {error}"
+            );
+        }
+        let mut value = artifact_value();
+        value["graph"]["quant"]["bits"]["weights"] = json!(32);
+        assert!(
+            reparse(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("bit width 32")
+        );
+    }
+
+    #[test]
+    fn artifact_deserialization_rejects_zero_geometry_and_padding() {
+        for (block, field, needle) in [
+            ("stride", "h", "stride height must be non-zero"),
+            ("stride", "w", "stride width must be non-zero"),
+            ("kernel", "h", "kernel height must be non-zero"),
+            ("kernel", "w", "kernel width must be non-zero"),
+        ] {
+            let mut value = artifact_value();
+            value["graph"]["layers"][0][block][field] = json!(0);
+            let error = reparse(&value).unwrap_err();
+            assert!(
+                error.to_string().contains(needle),
+                "tampering {block}.{field}: {error}"
+            );
+        }
+
+        let mut value = artifact_value();
+        assert_eq!(value["graph"]["layers"][0]["padding"]["Reflect"], json!(1));
+        value["graph"]["layers"][0]["padding"] = json!({ "Reflect": 0 });
+        let error = reparse(&value).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reflect padding must be non-zero"),
+            "unexpected error: {error}"
+        );
+
+        let mut value = artifact_value();
+        value["graph"]["layers"][0]["padding"] = json!({ "Zero": 0 });
+        let error = reparse(&value).unwrap_err();
+        assert!(
+            error.to_string().contains("zero padding must be non-zero"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn artifact_deserialization_rejects_out_of_range_scalars_and_zero_point() {
+        let mut value = artifact_value();
+        value["graph"]["points"][0]["scale"] = json!(0.0);
+        assert!(
+            reparse(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("declared scale is not a finite number"),
+            "zero point scale"
+        );
+
+        let mut value = artifact_value();
+        value["graph"]["layers"][0]["in_channels"] = json!(0);
+        assert!(
+            reparse(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("channels must be non-zero")
+        );
+
+        let mut value = artifact_value();
+        value["graph"]["layers"][0]["groups"] = json!(0);
+        assert!(
+            reparse(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("groups 0 must be >= 1")
+        );
+
+        let mut value = artifact_value();
+        value["graph"]["quant"]["act_zero_point"] = json!(3);
+        assert!(
+            reparse(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("act_zero_point 3")
+        );
+
+        let mut value = artifact_value();
+        value["graph"]["quant"]["act_qmax"] = json!(-1.0);
+        assert!(
+            reparse(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("declared qmax is not a finite number")
+        );
+
+        let mut value = artifact_value();
+        value["graph"]["layers"][0]["requant"][0] = json!(0.0);
+        assert!(
+            reparse(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("requant coefficient")
+        );
+    }
+
+    #[test]
+    fn artifact_deserialization_rejects_an_escaping_weight_file() {
+        for declared in [
+            "../weights.bin",
+            "/etc/passwd",
+            "blobs/../../weights.bin",
+            "",
+        ] {
+            // Provenance is checked on load, before a consumer stages the blob.
+            let mut value = artifact_value();
+            value["provenance"]["weight_file"] = json!(declared);
+            let artifact: GraphArtifact = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                artifact.validate(),
+                Err(GraphError::UnsafeWeightPath {
+                    file: declared.to_owned()
+                })
+            );
+
+            // The graph's own reference is checked by `Graph::validate`.
+            let mut value = artifact_value();
+            value["graph"]["weight_stream"]["file"] = json!(declared);
+            let artifact: GraphArtifact = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                artifact.validate(),
+                Err(GraphError::UnsafeWeightPath {
+                    file: declared.to_owned()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_geometry_extents() {
+        let mut graph = example_graph();
+        graph.layers[0].stride.h = Extent(0);
+        assert_eq!(
+            graph.validate(),
+            Err(GraphError::ZeroDimension {
+                layer: "enc.0".to_owned(),
+                what: "stride height",
+                value: 0,
+            })
+        );
+
+        let mut graph = example_graph();
+        graph.layers[0].kernel.w = Extent(0);
+        assert_eq!(
+            graph.validate(),
+            Err(GraphError::ZeroDimension {
+                layer: "enc.0".to_owned(),
+                what: "kernel width",
+                value: 0,
+            })
+        );
+
+        let mut graph = example_graph();
+        graph.layers[0].padding = Padding::Reflect(Extent(0));
+        assert_eq!(
+            graph.validate(),
+            Err(GraphError::ZeroDimension {
+                layer: "enc.0".to_owned(),
+                what: "padding",
+                value: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_an_out_of_range_bit_width_before_qmax_arithmetic() {
+        // `QuantContract::check` would compute `signed_qmax` from these widths.
+        let mut graph = example_graph();
+        graph.quant.bits.acts = BitWidth(0);
+        assert_eq!(
+            graph.validate(),
+            Err(GraphError::InvalidBitWidth {
+                what: "acts",
+                bits: 0
+            })
+        );
+
+        let mut graph = example_graph();
+        graph.quant.bits.weights = BitWidth(17);
+        assert_eq!(
+            graph.validate(),
+            Err(GraphError::InvalidBitWidth {
+                what: "weights",
+                bits: 17
+            })
+        );
+
+        // A layer cannot smuggle in a width the contract does not declare.
+        let mut graph = example_graph();
+        graph.layers[0].act_bits = BitWidth(0);
+        assert!(matches!(
+            graph.validate(),
+            Err(GraphError::InvalidBitWidth { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_a_non_positive_requant_coefficient() {
+        let mut graph = example_graph();
+        graph.layers[0].requant = RequantCoefficients(vec![0.5; 8]);
+        graph.layers[0].requant.0[3] = 0.0;
+        assert_eq!(
+            graph.validate(),
+            Err(GraphError::NonFinite {
+                what: "enc.0 requant coefficient".to_owned(),
+                value: 0.0,
+            })
+        );
+    }
+
+    #[test]
+    fn relu_layer_count_counts_layers_not_relu_ops() {
+        let graph = example_graph();
+        assert_eq!(graph.metrics().relu_layer_count, 1);
+
+        // The relu markers are redundant: a streaming manifest may omit them entirely.
+        let mut graph = example_graph();
+        graph.ops.retain(|op| !matches!(op, GraphOp::Relu { .. }));
+        graph.validate().unwrap();
+        let metrics = graph.metrics();
+        assert_eq!(metrics.relu_layer_count, 1);
+        assert_eq!(metrics.graph_op_count, 4);
+
+        // A second fused activation counts even without any marker of its own.
+        graph.layers[1].op = LayerOp::Conv2dRelu;
+        graph.layers[1].out_relu = true;
+        graph.validate().unwrap();
+        assert_eq!(graph.metrics().relu_layer_count, 2);
+    }
+
+    #[test]
+    fn round_trip_preserves_layer_metrics_without_relu_ops() {
+        let mut graph = example_graph();
+        graph.ops.retain(|op| !matches!(op, GraphOp::Relu { .. }));
+        let artifact = GraphArtifact::new(graph, provenance(&example_graph())).unwrap();
+        assert_eq!(artifact.metrics().relu_layer_count, 1);
+        let json = serde_json::to_string_pretty(&artifact).unwrap();
+        let parsed: GraphArtifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, artifact);
+        parsed.validate().unwrap();
     }
 }

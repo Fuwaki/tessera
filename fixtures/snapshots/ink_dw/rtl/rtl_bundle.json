@@ -1,0 +1,1156 @@
+{
+  "format": "tessera.rtl_bundle",
+  "schema_version": 1,
+  "kernel_id": "tessera.full_graph.i8i8.v1",
+  "provenance": {
+    "compiler_version": "0.1.0",
+    "git_revision": "unknown",
+    "dirty": false,
+    "graph_schema_version": 0,
+    "plan_schema_version": 1,
+    "target": "ti60f225",
+    "target_revision": "fpga_src-2026-10-10",
+    "input_manifest_sha256": "4dd97c7a52ab9759a24a1717b20b9710282072331c09e13fa1836c66b62185ce",
+    "weights_sha256": "fnv1a64:5d398cb3b7910d9c",
+    "planner_config_sha256": "ae5feaa8d6fb67c798f23ebf4dc1f9cd61e82db7a4fb2f3184b72784091ff534"
+  },
+  "plan": {
+    "plan_format": "tessera.execution_plan",
+    "plan_schema_version": 1,
+    "execution_mode": "shared_tile",
+    "granularity": "frame",
+    "engine": "shared_conv0",
+    "step_index": 0,
+    "step_count": 37,
+    "estimated_cycles": 491424,
+    "spatial_in": [
+      8,
+      8
+    ],
+    "spatial_out": [
+      8,
+      8
+    ]
+  },
+  "top_module": "tessera_full_graph_v1_tb",
+  "kernel_module": "tessera_full_graph_v1",
+  "layer": "quantize_u8_output",
+  "tile": {
+    "simd": 1,
+    "noc": 1,
+    "k": 1,
+    "fold": 1
+  },
+  "in_channels": 3,
+  "out_channels": 3,
+  "accumulator_width": 21,
+  "max_abs_accumulator": 1048044,
+  "kernel_cycles_per_window": 407114,
+  "requantization": [],
+  "requant_multiplier_error_ppm": 41,
+  "config": {
+    "module_prefix": "tessera",
+    "emit_testbench": true,
+    "emit_memory_images": true,
+    "fixture_windows": 16,
+    "fixture_seed": 6840143426475589633
+  },
+  "files": [
+    {
+      "name": "expected.hex",
+      "kind": "memory_image",
+      "bytes": 212874,
+      "fnv1a64": "bc34e4cc2d2e3506"
+    },
+    {
+      "name": "reference_steps.txt",
+      "kind": "memory_image",
+      "bytes": 112752,
+      "fnv1a64": "0f1be38f2fb9437a"
+    },
+    {
+      "name": "run_verilator.sh",
+      "kind": "script",
+      "bytes": 452,
+      "fnv1a64": "d1c735310fa9af18"
+    },
+    {
+      "name": "stim_input.hex",
+      "kind": "memory_image",
+      "bytes": 1275,
+      "fnv1a64": "3bdb6b0a881170bb"
+    },
+    {
+      "name": "tessera_full_graph_v1.sv",
+      "kind": "system_verilog",
+      "bytes": 2065363,
+      "fnv1a64": "4a5e9ffc2ced177e"
+    },
+    {
+      "name": "tessera_full_graph_v1.weights.hex",
+      "kind": "memory_image",
+      "bytes": 151142,
+      "fnv1a64": "ebdb9714d78dd986"
+    },
+    {
+      "name": "tessera_full_graph_v1_tb.sv",
+      "kind": "testbench",
+      "bytes": 53628,
+      "fnv1a64": "916056f5af89f0c5"
+    }
+  ],
+  "supported_operators": [
+    "full graph: dense conv2d (any kernel/stride, groups=1), depthwise conv2d, add with branch requantization, nearest 2x upsample, activation/requant, unsigned output quantization [tessera.full_graph.i8i8.v1]",
+    "requantization: fixed-point M0 in [0, 2^17) per output channel, uniform shift, round half away from zero, then saturation",
+    "borders: reflection (intref.rs::reflect_index, single step) and zero padding; activations: signed i8 with a 16-bit internal word for 9-bit residual sums; one shared 1-lane MAC array over a whole-frame arena"
+  ],
+  "supported_interface": [
+    "clk, rst (synchronous, active-high reset), start (frame start pulse), done (held until the next start)",
+    "in_data [7:0] signed int8 graph input codes, one code per beat, in_valid/in_ready",
+    "out_data [7:0] unsigned image codes, one code per beat, out_valid/out_ready; the frame's 192 output codes are streamed in channel-major order",
+    "dbg_en/dbg_addr[13-1:0]/dbg_data read the 4608x16-bit activation arena through the engine's single read port, serviced only while the FSM is idle or held (verification port, no second read port)",
+    "dbg_hold_en/dbg_cont/dbg_held: verification single-step. With dbg_hold_en low the FSM runs its schedule unchanged; with it high the FSM holds after the input load and after every step (dbg_held high) until dbg_cont is pulsed, so the testbench can read each step's codes through the shared debug port before the arena reuses them",
+    "testbench plusargs: +STIM=<path> +EXPECTED=<path> +TRACE=<path> +NOCHECK"
+  ],
+  "unsupported": [
+    "grouped convolution other than dense (groups=1) and depthwise (groups=in_channels)",
+    "any fold other than the shared engine's single lane (simd = pe = tap_parallel = 1, 1 multiplier)",
+    "row/tile scheduling granularity: the emitted engine makes one whole-frame pass per step",
+    "asymmetric quantization (non-zero activation or weight zero-points)",
+    "rounding other than half away from zero",
+    "saturation bounds outside signed 16 bits",
+    "activation element types other than i8/u8",
+    "reflection padding that needs more than a single reflection step",
+    "a tensor the plan does not budget in its activation-RAM region, or an arena larger than that region",
+    "a plan whose steps do not correspond one-to-one with the graph's lowered operators"
+  ],
+  "reuse_candidates": [
+    "nngen/examples/st_stream/rtl/sts_lib.v: sts_rq (bit-identical fx requantization)",
+    "nngen/examples/st_stream/rtl/sts_mvau (streaming SIMD/PE folding MAC array; the emitted engine is the same shared-array idea with one lane)",
+    "nngen/examples/st_stream/rtl/sts_rom (weight ROM with $readmemh initialization)"
+  ],
+  "reproduce": [
+    "emit: tessera::rtl::full::lower_full_graph -> tessera_full_graph_v1.sv + tessera_full_graph_v1_tb.sv + rtl_bundle.json",
+    "simulate: verilator --binary --timing -Wno-fatal --top-module tessera_full_graph_v1_tb -o tessera_full_graph_v1_tb_sim tessera_full_graph_v1.sv tessera_full_graph_v1_tb.sv && ./obj_dir/tessera_full_graph_v1_tb_sim",
+    "verify: the testbench prints TESSA_RTL_PASS with mismatches=0"
+  ],
+  "bundle_digest": "0db51b7fc9bc94b3",
+  "full_graph": {
+    "input": {
+      "c": 3,
+      "h": 8,
+      "w": 8
+    },
+    "output": {
+      "c": 3,
+      "h": 8,
+      "w": 8
+    },
+    "arena_words": 4608,
+    "arena_words_without_reuse": 21056,
+    "word_width": 16,
+    "accumulator_width": 21,
+    "accumulator_bound": 1048044,
+    "product_width": 40,
+    "mac_lanes": 1,
+    "total_macs": 399104,
+    "cycles_unstalled": 407114,
+    "frame": {
+      "load_beats": 192,
+      "step_beats": 406538,
+      "drain_beats": 384,
+      "total_beats": 407114
+    },
+    "plan_cycles": 491424,
+    "steps": [
+      {
+        "index": 0,
+        "op": "stem",
+        "kind": "Conv2d",
+        "mac_lanes": 1,
+        "macs": 55296,
+        "read_beats": 55296,
+        "mac_beats": 55296,
+        "epilogue_beats": 2048,
+        "store_beats": 2048,
+        "pipeline_beats": 2,
+        "generated_cycles": 55298,
+        "plan_estimated_cycles": 65119
+      },
+      {
+        "index": 1,
+        "op": "enc.0.dw",
+        "kind": "DepthwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 4608,
+        "read_beats": 4608,
+        "mac_beats": 4608,
+        "epilogue_beats": 512,
+        "store_beats": 512,
+        "pipeline_beats": 2,
+        "generated_cycles": 4610,
+        "plan_estimated_cycles": 5486
+      },
+      {
+        "index": 2,
+        "op": "enc.0.pw",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 32768,
+        "read_beats": 32768,
+        "mac_beats": 32768,
+        "epilogue_beats": 1024,
+        "store_beats": 1024,
+        "pipeline_beats": 2,
+        "generated_cycles": 32770,
+        "plan_estimated_cycles": 38615
+      },
+      {
+        "index": 3,
+        "op": "enc.1.dw",
+        "kind": "DepthwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 2304,
+        "read_beats": 2304,
+        "mac_beats": 2304,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 2306,
+        "plan_estimated_cycles": 2775
+      },
+      {
+        "index": 4,
+        "op": "enc.1.pw",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 16384,
+        "read_beats": 16384,
+        "mac_beats": 16384,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 16386,
+        "plan_estimated_cycles": 19340
+      },
+      {
+        "index": 5,
+        "op": "res.0.s1.dw",
+        "kind": "DepthwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 2304,
+        "read_beats": 2304,
+        "mac_beats": 2304,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 2306,
+        "plan_estimated_cycles": 2775
+      },
+      {
+        "index": 6,
+        "op": "res.0.s1.pw",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 16384,
+        "read_beats": 16384,
+        "mac_beats": 16384,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 16386,
+        "plan_estimated_cycles": 19340
+      },
+      {
+        "index": 7,
+        "op": "res.0.s2.dw",
+        "kind": "DepthwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 2304,
+        "read_beats": 2304,
+        "mac_beats": 2304,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 2306,
+        "plan_estimated_cycles": 2775
+      },
+      {
+        "index": 8,
+        "op": "res.0.s2.pw",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 16384,
+        "read_beats": 16384,
+        "mac_beats": 16384,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 16386,
+        "plan_estimated_cycles": 19340
+      },
+      {
+        "index": 9,
+        "op": "add.9",
+        "kind": "Add",
+        "mac_lanes": 0,
+        "macs": 0,
+        "read_beats": 512,
+        "mac_beats": 0,
+        "epilogue_beats": 0,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 514,
+        "plan_estimated_cycles": 667
+      },
+      {
+        "index": 10,
+        "op": "res.1.s1.dw",
+        "kind": "DepthwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 2304,
+        "read_beats": 2304,
+        "mac_beats": 2304,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 2306,
+        "plan_estimated_cycles": 2775
+      },
+      {
+        "index": 11,
+        "op": "res.1.s1.pw",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 16384,
+        "read_beats": 16384,
+        "mac_beats": 16384,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 16386,
+        "plan_estimated_cycles": 19340
+      },
+      {
+        "index": 12,
+        "op": "res.1.s2.dw",
+        "kind": "DepthwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 2304,
+        "read_beats": 2304,
+        "mac_beats": 2304,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 2306,
+        "plan_estimated_cycles": 2775
+      },
+      {
+        "index": 13,
+        "op": "res.1.s2.pw",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 16384,
+        "read_beats": 16384,
+        "mac_beats": 16384,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 16386,
+        "plan_estimated_cycles": 19340
+      },
+      {
+        "index": 14,
+        "op": "add.13",
+        "kind": "Add",
+        "mac_lanes": 0,
+        "macs": 0,
+        "read_beats": 512,
+        "mac_beats": 0,
+        "epilogue_beats": 0,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 514,
+        "plan_estimated_cycles": 667
+      },
+      {
+        "index": 15,
+        "op": "res.2.s1.dw",
+        "kind": "DepthwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 2304,
+        "read_beats": 2304,
+        "mac_beats": 2304,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 2306,
+        "plan_estimated_cycles": 2775
+      },
+      {
+        "index": 16,
+        "op": "res.2.s1.pw",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 16384,
+        "read_beats": 16384,
+        "mac_beats": 16384,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 16386,
+        "plan_estimated_cycles": 19340
+      },
+      {
+        "index": 17,
+        "op": "res.2.s2.dw",
+        "kind": "DepthwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 2304,
+        "read_beats": 2304,
+        "mac_beats": 2304,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 2306,
+        "plan_estimated_cycles": 2775
+      },
+      {
+        "index": 18,
+        "op": "res.2.s2.pw",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 16384,
+        "read_beats": 16384,
+        "mac_beats": 16384,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 16386,
+        "plan_estimated_cycles": 19340
+      },
+      {
+        "index": 19,
+        "op": "add.17",
+        "kind": "Add",
+        "mac_lanes": 0,
+        "macs": 0,
+        "read_beats": 512,
+        "mac_beats": 0,
+        "epilogue_beats": 0,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 514,
+        "plan_estimated_cycles": 667
+      },
+      {
+        "index": 20,
+        "op": "res.3.s1.dw",
+        "kind": "DepthwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 2304,
+        "read_beats": 2304,
+        "mac_beats": 2304,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 2306,
+        "plan_estimated_cycles": 2775
+      },
+      {
+        "index": 21,
+        "op": "res.3.s1.pw",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 16384,
+        "read_beats": 16384,
+        "mac_beats": 16384,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 16386,
+        "plan_estimated_cycles": 19340
+      },
+      {
+        "index": 22,
+        "op": "res.3.s2.dw",
+        "kind": "DepthwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 2304,
+        "read_beats": 2304,
+        "mac_beats": 2304,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 2306,
+        "plan_estimated_cycles": 2775
+      },
+      {
+        "index": 23,
+        "op": "res.3.s2.pw",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 16384,
+        "read_beats": 16384,
+        "mac_beats": 16384,
+        "epilogue_beats": 256,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 16386,
+        "plan_estimated_cycles": 19340
+      },
+      {
+        "index": 24,
+        "op": "add.21",
+        "kind": "Add",
+        "mac_lanes": 0,
+        "macs": 0,
+        "read_beats": 512,
+        "mac_beats": 0,
+        "epilogue_beats": 0,
+        "store_beats": 256,
+        "pipeline_beats": 2,
+        "generated_cycles": 514,
+        "plan_estimated_cycles": 667
+      },
+      {
+        "index": 25,
+        "op": "upsample_nearest2x.21",
+        "kind": "NearestUpsample2x",
+        "mac_lanes": 0,
+        "macs": 0,
+        "read_beats": 1024,
+        "mac_beats": 0,
+        "epilogue_beats": 0,
+        "store_beats": 1024,
+        "pipeline_beats": 2,
+        "generated_cycles": 1026,
+        "plan_estimated_cycles": 1269
+      },
+      {
+        "index": 26,
+        "op": "add.21.2",
+        "kind": "Add",
+        "mac_lanes": 0,
+        "macs": 0,
+        "read_beats": 2048,
+        "mac_beats": 0,
+        "epilogue_beats": 0,
+        "store_beats": 1024,
+        "pipeline_beats": 2,
+        "generated_cycles": 2050,
+        "plan_estimated_cycles": 2474
+      },
+      {
+        "index": 27,
+        "op": "up3.0.dw",
+        "kind": "DepthwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 9216,
+        "read_beats": 9216,
+        "mac_beats": 9216,
+        "epilogue_beats": 1024,
+        "store_beats": 1024,
+        "pipeline_beats": 2,
+        "generated_cycles": 9218,
+        "plan_estimated_cycles": 21749
+      },
+      {
+        "index": 28,
+        "op": "up3.0.pw",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 32768,
+        "read_beats": 32768,
+        "mac_beats": 32768,
+        "epilogue_beats": 512,
+        "store_beats": 512,
+        "pipeline_beats": 2,
+        "generated_cycles": 32770,
+        "plan_estimated_cycles": 38615
+      },
+      {
+        "index": 29,
+        "op": "up1.0",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 16384,
+        "read_beats": 16384,
+        "mac_beats": 16384,
+        "epilogue_beats": 512,
+        "store_beats": 512,
+        "pipeline_beats": 2,
+        "generated_cycles": 16386,
+        "plan_estimated_cycles": 19340
+      },
+      {
+        "index": 30,
+        "op": "upsample_nearest2x.24",
+        "kind": "NearestUpsample2x",
+        "mac_lanes": 0,
+        "macs": 0,
+        "read_beats": 2048,
+        "mac_beats": 0,
+        "epilogue_beats": 0,
+        "store_beats": 2048,
+        "pipeline_beats": 2,
+        "generated_cycles": 2050,
+        "plan_estimated_cycles": 2474
+      },
+      {
+        "index": 31,
+        "op": "up3.1.dw",
+        "kind": "DepthwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 18432,
+        "read_beats": 18432,
+        "mac_beats": 18432,
+        "epilogue_beats": 2048,
+        "store_beats": 2048,
+        "pipeline_beats": 2,
+        "generated_cycles": 18434,
+        "plan_estimated_cycles": 21749
+      },
+      {
+        "index": 32,
+        "op": "up3.1.pw",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 32768,
+        "read_beats": 32768,
+        "mac_beats": 32768,
+        "epilogue_beats": 1024,
+        "store_beats": 1024,
+        "pipeline_beats": 2,
+        "generated_cycles": 32770,
+        "plan_estimated_cycles": 38615
+      },
+      {
+        "index": 33,
+        "op": "up1.1",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 16384,
+        "read_beats": 16384,
+        "mac_beats": 16384,
+        "epilogue_beats": 1024,
+        "store_beats": 1024,
+        "pipeline_beats": 2,
+        "generated_cycles": 16386,
+        "plan_estimated_cycles": 19340
+      },
+      {
+        "index": 34,
+        "op": "head.dw",
+        "kind": "DepthwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 9216,
+        "read_beats": 9216,
+        "mac_beats": 9216,
+        "epilogue_beats": 1024,
+        "store_beats": 1024,
+        "pipeline_beats": 2,
+        "generated_cycles": 9218,
+        "plan_estimated_cycles": 10907
+      },
+      {
+        "index": 35,
+        "op": "head.pw",
+        "kind": "PointwiseConv2d",
+        "mac_lanes": 1,
+        "macs": 3072,
+        "read_beats": 3072,
+        "mac_beats": 3072,
+        "epilogue_beats": 192,
+        "store_beats": 192,
+        "pipeline_beats": 2,
+        "generated_cycles": 3074,
+        "plan_estimated_cycles": 3679
+      },
+      {
+        "index": 36,
+        "op": "quantize_u8_output",
+        "kind": "QuantizeOutput",
+        "mac_lanes": 0,
+        "macs": 0,
+        "read_beats": 192,
+        "mac_beats": 0,
+        "epilogue_beats": 0,
+        "store_beats": 192,
+        "pipeline_beats": 2,
+        "generated_cycles": 194,
+        "plan_estimated_cycles": 290
+      }
+    ],
+    "slots": [
+      {
+        "name": "p0.v0",
+        "offset": 0,
+        "elements": 192,
+        "bytes": 384,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          0,
+          0
+        ]
+      },
+      {
+        "name": "p1.v0",
+        "offset": 192,
+        "elements": 2048,
+        "bytes": 4096,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          0,
+          1
+        ]
+      },
+      {
+        "name": "p2.v0",
+        "offset": 2240,
+        "elements": 512,
+        "bytes": 1024,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          1,
+          2
+        ]
+      },
+      {
+        "name": "p3.v0",
+        "offset": 0,
+        "elements": 1024,
+        "bytes": 2048,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          2,
+          26
+        ]
+      },
+      {
+        "name": "p4.v0",
+        "offset": 1024,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          3,
+          4
+        ]
+      },
+      {
+        "name": "p5.v0",
+        "offset": 1280,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          4,
+          9
+        ]
+      },
+      {
+        "name": "p6.v0",
+        "offset": 1024,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          5,
+          6
+        ]
+      },
+      {
+        "name": "p7.v0",
+        "offset": 1536,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          6,
+          7
+        ]
+      },
+      {
+        "name": "p8.v0",
+        "offset": 1024,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          7,
+          8
+        ]
+      },
+      {
+        "name": "p9.v0",
+        "offset": 1536,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          8,
+          9
+        ]
+      },
+      {
+        "name": "p9.v1",
+        "offset": 1024,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i9",
+        "max_abs": 254,
+        "live": [
+          9,
+          14
+        ]
+      },
+      {
+        "name": "p10.v0",
+        "offset": 1280,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          10,
+          11
+        ]
+      },
+      {
+        "name": "p11.v0",
+        "offset": 1536,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          11,
+          12
+        ]
+      },
+      {
+        "name": "p12.v0",
+        "offset": 1280,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          12,
+          13
+        ]
+      },
+      {
+        "name": "p13.v0",
+        "offset": 1536,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          13,
+          14
+        ]
+      },
+      {
+        "name": "p13.v1",
+        "offset": 1280,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i9",
+        "max_abs": 254,
+        "live": [
+          14,
+          19
+        ]
+      },
+      {
+        "name": "p14.v0",
+        "offset": 1024,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          15,
+          16
+        ]
+      },
+      {
+        "name": "p15.v0",
+        "offset": 1536,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          16,
+          17
+        ]
+      },
+      {
+        "name": "p16.v0",
+        "offset": 1024,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          17,
+          18
+        ]
+      },
+      {
+        "name": "p17.v0",
+        "offset": 1536,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          18,
+          19
+        ]
+      },
+      {
+        "name": "p17.v1",
+        "offset": 1024,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i9",
+        "max_abs": 254,
+        "live": [
+          19,
+          24
+        ]
+      },
+      {
+        "name": "p18.v0",
+        "offset": 1280,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          20,
+          21
+        ]
+      },
+      {
+        "name": "p19.v0",
+        "offset": 1536,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          21,
+          22
+        ]
+      },
+      {
+        "name": "p20.v0",
+        "offset": 1280,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          22,
+          23
+        ]
+      },
+      {
+        "name": "p21.v0",
+        "offset": 1536,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          23,
+          24
+        ]
+      },
+      {
+        "name": "p21.v1",
+        "offset": 1280,
+        "elements": 256,
+        "bytes": 512,
+        "domain": "i9",
+        "max_abs": 254,
+        "live": [
+          24,
+          25
+        ]
+      },
+      {
+        "name": "p21.v2",
+        "offset": 1536,
+        "elements": 1024,
+        "bytes": 2048,
+        "domain": "i9",
+        "max_abs": 254,
+        "live": [
+          25,
+          26
+        ]
+      },
+      {
+        "name": "p21.v3",
+        "offset": 2560,
+        "elements": 1024,
+        "bytes": 2048,
+        "domain": "i16",
+        "max_abs": 381,
+        "live": [
+          26,
+          27
+        ]
+      },
+      {
+        "name": "p22.v0",
+        "offset": 0,
+        "elements": 1024,
+        "bytes": 2048,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          27,
+          28
+        ]
+      },
+      {
+        "name": "p23.v0",
+        "offset": 1024,
+        "elements": 512,
+        "bytes": 1024,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          28,
+          29
+        ]
+      },
+      {
+        "name": "p24.v0",
+        "offset": 0,
+        "elements": 512,
+        "bytes": 1024,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          29,
+          30
+        ]
+      },
+      {
+        "name": "p24.v1",
+        "offset": 512,
+        "elements": 2048,
+        "bytes": 4096,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          30,
+          31
+        ]
+      },
+      {
+        "name": "p25.v0",
+        "offset": 2560,
+        "elements": 2048,
+        "bytes": 4096,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          31,
+          32
+        ]
+      },
+      {
+        "name": "p26.v0",
+        "offset": 0,
+        "elements": 1024,
+        "bytes": 2048,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          32,
+          33
+        ]
+      },
+      {
+        "name": "p27.v0",
+        "offset": 1024,
+        "elements": 1024,
+        "bytes": 2048,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          33,
+          34
+        ]
+      },
+      {
+        "name": "p28.v0",
+        "offset": 0,
+        "elements": 1024,
+        "bytes": 2048,
+        "domain": "i8",
+        "max_abs": 127,
+        "live": [
+          34,
+          35
+        ]
+      },
+      {
+        "name": "image.v0",
+        "offset": 1024,
+        "elements": 192,
+        "bytes": 384,
+        "domain": "u8",
+        "max_abs": 255,
+        "live": [
+          35,
+          36
+        ]
+      },
+      {
+        "name": "output.u8",
+        "offset": 0,
+        "elements": 192,
+        "bytes": 384,
+        "domain": "u8",
+        "max_abs": 255,
+        "live": [
+          36,
+          36
+        ]
+      }
+    ],
+    "semantic_notes": [
+      "graph lowering notes: layer stem: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer enc.0.dw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer enc.0.pw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer enc.1.dw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer enc.1.pw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer res.0.s1.dw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer res.0.s1.pw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer res.0.s2.dw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; add on point 9: branch requant factor 0.037562583/0.038937587 serialized to M0=126443 shift=17 (worst relative error 3.522e-6); layer res.1.s1.dw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer res.1.s1.pw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer res.1.s2.dw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; add on point 13: branch requant factor 0.038937587/0.044928227 serialized to M0=113595 shift=17 (worst relative error 1.100e-6); layer res.2.s1.dw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer res.2.s1.pw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer res.2.s2.dw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; add on point 17: branch requant factor 0.044928227/0.055301484 serialized to M0=106486 shift=17 (worst relative error 2.201e-7); layer res.3.s1.dw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer res.3.s1.pw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer res.3.s2.dw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; add on point 21: branch requant factor 0.055301484/0.09216764 serialized to M0=78644 shift=17 (worst relative error 6.159e-6); add on point 21: branch requant factor 0.07184201/0.09216764 serialized to M0=102167 shift=17 (worst relative error 1.682e-6); layer up3.0.dw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer up3.0.pw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer up1.0: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer up3.1.dw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer up3.1.pw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer up1.1: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field; layer head.dw: `relu` graph op skipped; the fused activation is carried by the convolution op's activation field",
+      "activation arena words are 16-bit because the residual `add` is unclamped (intref.rs:257-268), so codes leave the i8 domain after a residual sum",
+      "one shared single-lane engine: exactly one 16x8 MAC multiplier and one 21x17 requantization multiplier serve every step of the schedule (DSP count does not grow with the layer count); steps differ only in the muxed address/control they present",
+      "arena allocation reuses words by tensor lifetime: 4608 words peak against 21056 words if every slot were kept live; the plan's activation-RAM region covers it",
+      "requantization is the fixed-point `(acc*M0 + round) >> shift` datapath; the manifest's f32 coefficients are reported separately and are NOT reproduced bit for bit (bounded by Requant::multiplier_error_ppm)",
+      "timed structure: every read is registered (one cycle); the MAC stage consumes the previous address stage, so a product lands every cycle and a store drains one cycle after its element; the epilogue multiplier sits between registers. The recorded frame beats are the unstalled schedule and are measured by the generated testbench; input gaps and output backpressure are counted separately and are never folded in",
+      "provenance: weights are resolved through the supplied WeightResolver for `weights:{layer}` tensors and the embedded bytes digest to fnv1a64:5d398cb3b7910d9c; `bias_int32` comes from the graph artifact's layer and the plan's bias-tensor presence is cross-checked against it; the plan's declared weights digest was None",
+      "physical mapping: one shared activation arena of 4608 x 16-bit words with lifetime reuse (21056 words if every tensor stayed live), 1 MAC multiplier, one requantization multiplier, and 407114 unstalled beats per frame; graph-internal activations never leave the chip (no internal DMA and no DDR port), so the plan's DDR figures for internal buffers are not realized by this structure, only the graph input and output cross the module boundary",
+      "generated unstalled beats 407114 = load 192 + steps 406538 + drain 384; plan estimate 491424 (plan/estimate = 1.207); the plan number is an estimate and is never presented as measured",
+      "plan arena budget: engine.arena_words = 4608 vs emitted 4608 words (same lifetime allocation, so the plan charges exactly the emitted high-water mark)"
+    ]
+  }
+}

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use tessera::frontend;
 use tessera::graph::GraphArtifact;
-use tessera::layout::{ExecutionPlan, LayoutArtifact, MemoryPlacement, PlanStatus};
+use tessera::layout::{ExecutionMode, ExecutionPlan, Granularity, LayoutArtifact, PlanStatus};
 use tessera::lower::{InputShape, lower_graph};
 use tessera::mlir::{self, MlirOptions, SourceGraph};
 use tessera::planner::{self, Policy, ProvenanceInput};
@@ -28,8 +28,14 @@ fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
 }
 
+/// Scratch directory for one test, under `TESSERA_TEST_TMPDIR` (default
+/// `/var/tmp`): a full-graph bundle plus a Verilator build is hundreds of
+/// megabytes, and `/tmp` is often a small tmpfs shared with other work.
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("tessera-pipeline-{tag}-{}", std::process::id()));
+    let base = std::env::var_os("TESSERA_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/tmp"));
+    let dir = base.join(format!("tessera-pipeline-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
@@ -178,6 +184,8 @@ fn lowering_preserves_weights_bias_and_per_channel_requantization() {
             "stem",
             "dw",
             "mid",
+            // Named by the point they write, with an occurrence suffix only when a
+            // model writes a point twice.
             "add.3",
             "upsample_nearest2x.3",
             "head",
@@ -334,13 +342,13 @@ fn input_shape_parsing_rejects_anything_the_compiler_cannot_lower() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn whole_network_plan_streams_every_step_and_is_rejected_by_the_narrow_backend() {
+fn whole_network_plan_fits_the_emitted_envelope_and_the_single_kernel_backend_rejects_it() {
     let artifact = w8_artifact();
     let (plan, _) = lower_graph(artifact.graph(), w8_shape()).expect("lower");
     let layout = planner::solve(
         &plan,
         &target(),
-        &policy("explore.toml"),
+        &policy("emit.toml"),
         &provenance("graph-sha"),
     )
     .expect("solve");
@@ -353,34 +361,70 @@ fn whole_network_plan_streams_every_step_and_is_rejected_by_the_narrow_backend()
         plan.ops.len(),
         "every lowered operator is scheduled"
     );
-
-    // Every step interface resolves to a declared buffer, and a streaming engine
-    // reads and writes on-chip stream buffers rather than raw DDR ports.
+    // The generated engine is one shared array over an on-chip arena, so the
+    // plan must be a shared-tile frame schedule with a single lane per step.
+    assert_eq!(execution.execution_mode, ExecutionMode::SharedTile);
+    assert_eq!(
+        layout.selection.as_ref().unwrap().granularity,
+        Granularity::Frame
+    );
     for step in &execution.steps {
+        assert_eq!(
+            step.tap_parallel, 1,
+            "step {} asks for tap parallelism the engine does not have",
+            step.op
+        );
         for name in [&step.input_buffer, &step.output_buffer] {
-            let binding = execution
-                .buffers
-                .iter()
-                .find(|b| &b.name == name)
-                .unwrap_or_else(|| panic!("step {} buffer {name} is undeclared", step.op));
-            assert_ne!(
-                binding.placement,
-                MemoryPlacement::Ddr,
-                "step {} streams {name} through an on-chip buffer",
+            assert!(
+                execution.buffers.iter().any(|b| &b.name == name),
+                "step {} buffer {name} is undeclared",
                 step.op
             );
         }
     }
 
-    // The narrow v1 backend rejects the whole network, naming every step.
+    // The single-kernel backend still refuses a multi-step plan: either because
+    // the plan is not one pointwise step, or because its shared-tile engine is
+    // not the interface that backend emits.
     let resolver = GraphWeightResolver::load(&artifact, fixtures().join("w8")).expect("resolver");
     let error = SystemVerilogBackend
         .lower_execution_plan(&execution, &resolver, &RtlConfig::default())
-        .expect_err("a seven-step plan is outside the emitted envelope");
+        .expect_err("a seven-step plan is outside the single-kernel envelope");
     let text = error.to_string();
-    assert!(text.contains("single pointwise step"), "{text}");
-    assert!(text.contains("stem"), "{text}");
-    assert!(text.contains("quantize_u8_output"), "{text}");
+    assert!(
+        text.contains("single pointwise step") || text.contains("shared_tile"),
+        "the rejection must name the plan shape: {text}"
+    );
+}
+
+#[test]
+fn emit_policy_keeps_every_convolution_step_within_the_emitted_envelope() {
+    // The generated engine instantiates `simd * pe` real multipliers and iterates
+    // taps sequentially, so an emittable plan needs tap_parallel == 1 and at most
+    // 64 lanes per convolution step. This locks the fixture policy to that
+    // envelope, so editing the policy cannot silently produce plans the backend
+    // must reject.
+    for (name, graph_shape) in [("w8", w8_shape())] {
+        let artifact = w8_artifact();
+        let (plan, _) = lower_graph(artifact.graph(), graph_shape).expect("lower");
+        let layout = planner::solve(&plan, &target(), &policy("emit.toml"), &provenance("sha"))
+            .unwrap_or_else(|error| panic!("{name}: solve: {error}"));
+        layout
+            .verify()
+            .unwrap_or_else(|error| panic!("{name}: verify: {error}"));
+        let execution = layout.execution_plan().expect("projection");
+        for step in &execution.steps {
+            assert_eq!(step.tap_parallel, 1, "{name}: step {}", step.op);
+            if step.op_kind.is_convolution() {
+                assert!(
+                    u64::from(step.simd) * u64::from(step.pe) <= 64,
+                    "{name}: step {} wants {} lanes",
+                    step.op,
+                    u64::from(step.simd) * u64::from(step.pe)
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -538,7 +582,7 @@ fn manifest_weight_bytes_reach_the_emitted_rom() {
             "weights": 1, "bias": null, "groups": 1, "stride": [1, 1],
             "padding": { "zero": { "top": 0, "bottom": 0, "left": 0, "right": 0 } },
             "requant": {
-              "m0": 65536, "shift": 18, "rounding": "half_up",
+              "m0": 65536, "shift": 18, "rounding": "half_away_from_zero",
               "saturate_lo": -128, "saturate_hi": 127
             },
             "activation": { "kind": "relu", "clamp_lo": 0, "clamp_hi": 127 }
@@ -636,4 +680,230 @@ fn pointwise_fixture_matches_the_reference_model_under_verilator() {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Serves a graph's weight bytes with one tensor's contents replaced, so a
+/// fixture property can be tested by changing the model rather than by reasoning
+/// about it.
+struct HeadPatchedResolver<'a> {
+    inner: GraphWeightResolver<'a>,
+    tensor: String,
+    head_bytes: Vec<u8>,
+}
+
+impl WeightResolver for HeadPatchedResolver<'_> {
+    fn tensor_bytes(
+        &self,
+        tensor: &tessera::layout::TensorRef,
+    ) -> Result<Vec<u8>, tessera::rtl::RtlError> {
+        let mut bytes = self.inner.tensor_bytes(tensor)?;
+        if tensor.name == self.tensor {
+            assert_eq!(bytes.len(), self.head_bytes.len(), "patched tensor length");
+            bytes.copy_from_slice(&self.head_bytes);
+        }
+        Ok(bytes)
+    }
+}
+
+#[test]
+fn w8_image_evidence_is_sized_to_the_fixture_it_comes_from() {
+    // The head reads the upsampled tensor, which is never negative, so a head row
+    // with no positive coefficient is identically zero for *every* stimulus and
+    // its output channel is structurally dead. This test states the consequence
+    // of the fixture as it stands and switches to the stronger requirement once
+    // the rows are fixed, so an image-level comparison can never be read as
+    // evidence it is not -- and fixing the rows cannot be mistaken for a
+    // semantic change in the compiler.
+    let artifact = w8_artifact();
+    let head = artifact.graph().layer_named("head").expect("head layer");
+    assert_eq!(
+        (head.out_channels.get(), head.in_channels.get()),
+        (3, 4),
+        "the fixture's head geometry is part of the assertion"
+    );
+    let blob = std::fs::read(fixtures().join("w8/weights.bin")).expect("weight blob");
+    let codes: Vec<i8> = blob[head.weight_byte_offset..head.weight_byte_offset + head.weight_bytes]
+        .iter()
+        .map(|byte| *byte as i8)
+        .collect();
+    assert_eq!(codes.len(), 12, "the head is a 3x4 pointwise matrix");
+    let dead_rows = codes
+        .chunks(4)
+        .filter(|row| !row.iter().any(|code| *code > 0))
+        .count();
+
+    // The image the reference produces for a deterministic stimulus set.
+    let (plan, _) = lower_graph(artifact.graph(), w8_shape()).expect("lower");
+    let layout =
+        planner::solve(&plan, &target(), &policy("emit.toml"), &provenance("sha")).expect("solve");
+    let execution = layout.execution_plan().expect("projection");
+    let resolver = GraphWeightResolver::load(&artifact, fixtures().join("w8")).expect("resolver");
+    let model =
+        tessera::rtl::full::FullGraphModel::resolve(artifact.graph(), &execution, &resolver)
+            .expect("full-graph model");
+    let elements = plan
+        .tensor(plan.inputs[0])
+        .expect("input tensor")
+        .shape
+        .elements() as usize;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stimuli = Vec::new();
+    for seed in [1u64, 7, 0x5eed] {
+        let mut state = seed | 1;
+        stimuli.push(
+            (0..elements)
+                .map(|_| {
+                    state ^= state >> 12;
+                    state ^= state << 25;
+                    state ^= state >> 27;
+                    ((state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 33) as i64 % 255) - 127
+                })
+                .collect::<Vec<i64>>(),
+        );
+    }
+    stimuli.push(vec![127i64; elements]);
+    for frame in stimuli {
+        let run =
+            tessera::rtl::reference::run_integer(&model, &[frame]).expect("reference evaluation");
+        let image = run.frames[0]
+            .steps
+            .last()
+            .expect("the image step is scheduled");
+        assert_eq!(image.name, "quantize_u8_output");
+        seen.extend(image.codes.iter().copied());
+    }
+
+    if dead_rows > 0 {
+        // A row with no positive coefficient contributes nothing: the head reads
+        // a non-negative tensor, so its accumulator can only be <= 0 and the
+        // clamp maps it to 0. Prove that dynamically by zeroing those rows and
+        // re-running the reference: the image must be *identical*, which is what
+        // makes an image-level comparison on this fixture weaker evidence than
+        // the step traces (fixtures/acceptance/graph carries the discriminating
+        // coverage).
+        let mut head_bytes = codes.iter().map(|code| *code as u8).collect::<Vec<u8>>();
+        for (index, row) in codes.chunks(4).enumerate() {
+            if !row.iter().any(|code| *code > 0) {
+                for offset in 0..4 {
+                    head_bytes[index * 4 + offset] = 0;
+                }
+            }
+        }
+        let inner = GraphWeightResolver::load(&artifact, fixtures().join("w8")).expect("resolver");
+        let patched = HeadPatchedResolver {
+            inner,
+            tensor: tessera::lower::weight_tensor_name("head"),
+            head_bytes,
+        };
+        let patched_model =
+            tessera::rtl::full::FullGraphModel::resolve(artifact.graph(), &execution, &patched)
+                .expect("full-graph model with the dead rows zeroed");
+        let mut patched_seen = std::collections::BTreeSet::new();
+        let mut stimuli = Vec::new();
+        let mut state = 0x5eedu64 | 1;
+        stimuli.push(
+            (0..elements)
+                .map(|_| {
+                    state ^= state >> 12;
+                    state ^= state << 25;
+                    state ^= state >> 27;
+                    ((state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 33) as i64 % 255) - 127
+                })
+                .collect::<Vec<i64>>(),
+        );
+        stimuli.push(vec![127i64; elements]);
+        for frame in stimuli {
+            let run = tessera::rtl::reference::run_integer(&patched_model, &[frame])
+                .expect("reference evaluation");
+            patched_seen.extend(
+                run.frames[0]
+                    .steps
+                    .last()
+                    .expect("the image step is scheduled")
+                    .codes
+                    .iter()
+                    .copied(),
+            );
+        }
+        assert_eq!(
+            seen, patched_seen,
+            "a head row without a positive coefficient must not move the image at all"
+        );
+        eprintln!(
+            "fixtures/w8: {dead_rows} of 3 head rows have no positive coefficient, so that many \
+             output channels are identically zero and image codes are limited to {seen:?}; \
+             zeroing those rows leaves the image unchanged. Discriminating image evidence comes \
+             from fixtures/acceptance/graph."
+        );
+        return;
+    }
+
+    // Once every head row has both signs, the image must actually vary and clamp
+    // at both ends; anything less means the fixture regressed.
+    assert!(
+        seen.len() >= 4,
+        "the W8 image must vary over the stimulus set, found {seen:?}"
+    );
+    assert!(
+        seen.contains(&0) && seen.contains(&255),
+        "the unsigned clamp must actually clamp at both ends, found {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|code| *code > 0 && *code < 255),
+        "the image must contain an interior value, found {seen:?}"
+    );
+}
+
+/// The datapath rounds **half away from zero**, which is not the same rule as
+/// "half up" (toward positive infinity): the two disagree exactly at negative
+/// ties. This test states both rules and asserts that the emitted requantization
+/// matches away-from-zero while a toward-+infinity rule would differ, so the
+/// contract's name is backed by behaviour rather than by a comment.
+#[test]
+fn negative_ties_round_away_from_zero_not_toward_positive_infinity() {
+    use tessera::rtl::{ChannelRequant, reference_requant};
+
+    // `m0 = 2^16`, `shift = 17`: the product of one accumulator step is exactly
+    // one half in the scaled domain, so every assertion below is a tie or a
+    // quarter, never a rounding accident.
+    let channel = ChannelRequant {
+        multiplier: 1 << 16,
+        shift: 17,
+        lo: -128,
+        hi: 127,
+    };
+
+    // The rule the datapath implements, spelled out: add `2^(shift-1)` to a
+    // non-negative product and `2^(shift-1) - 1` to a negative one, then
+    // arithmetic-shift right.
+    let away_from_zero = |acc: i64| -> i64 {
+        let product = acc * i64::from(channel.multiplier);
+        let offset = if product >= 0 { 1 << 16 } else { (1 << 16) - 1 };
+        (product + offset) >> channel.shift
+    };
+    // The misleading rule: "half up" as in toward positive infinity.
+    let toward_positive_infinity =
+        |acc: i64| -> i64 { (acc * i64::from(channel.multiplier) + (1 << 16)) >> channel.shift };
+
+    assert_eq!(reference_requant(1, &channel), 1);
+    // -1 * 2^16 = -0.5 exactly: away from zero is -1, toward +inf is 0.
+    assert_eq!(reference_requant(-1, &channel), -1);
+    // -3 * 2^16 = -1.5 exactly: away from zero is -2, toward +inf is -1.
+    assert_eq!(reference_requant(-3, &channel), -2);
+
+    for acc in [-3i64, -1, 1, 3] {
+        assert_eq!(
+            reference_requant(acc, &channel),
+            away_from_zero(acc),
+            "acc {acc}: the datapath must be half-away-from-zero"
+        );
+    }
+    for acc in [-3i64, -1] {
+        assert_ne!(
+            reference_requant(acc, &channel),
+            toward_positive_infinity(acc),
+            "acc {acc}: the two rules must be distinguishable, or the contract's name is \
+             untested"
+        );
+    }
 }

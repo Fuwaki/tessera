@@ -1,0 +1,350 @@
+{
+  "format": "tessera.acceptance_vectors.v1",
+  "fixture": "rounding",
+  "shape": {
+    "c": 4,
+    "h": 2,
+    "w": 2
+  },
+  "derivation": [
+    "acc is an int32 accumulator: bias_int32[oc] + sum over taps of code*weight_code",
+    "code = clamp( (acc*M0 + (acc*M0 >= 0 ? 2^(shift-1) : 2^(shift-1)-1)) >> shift, lo, hi )  (round half away from zero, then clamp)",
+    "M0/shift are derived independently from the manifest's f32 requant vector: shift = floor(log2((2^17-1)/max(requant))), M0 = round_half_away(requant*2^shift)",
+    "head output is the unsigned image; quantize_u8_output multiplies codes by 0.003921569"
+  ],
+  "layers": [
+    {
+      "name": "rnd",
+      "step_match": "rnd",
+      "elem": "i8",
+      "shape": {
+        "c": 4,
+        "h": 2,
+        "w": 2
+      },
+      "bias_int32": [
+        0,
+        0,
+        2000,
+        -2000
+      ],
+      "requant": {
+        "m0": [
+          65536,
+          32768,
+          65536,
+          65536
+        ],
+        "shift": 18,
+        "clamp": [
+          -127,
+          127
+        ],
+        "rounding": "half_away_from_zero",
+        "per_channel_multipliers": [
+          0.25,
+          0.125,
+          0.25,
+          0.25
+        ]
+      }
+    },
+    {
+      "name": "head",
+      "step_match": "head",
+      "elem": "u8",
+      "shape": {
+        "c": 3,
+        "h": 2,
+        "w": 2
+      },
+      "bias_int32": [
+        0,
+        0,
+        0
+      ],
+      "requant": {
+        "m0": [
+          65536,
+          65536,
+          65536
+        ],
+        "shift": 16,
+        "clamp": [
+          0,
+          255
+        ],
+        "rounding": "half_away_from_zero",
+        "per_channel_multipliers": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "name": "quantize_u8_output",
+      "step_match": "quantize_u8_output",
+      "elem": "u8",
+      "shape": {
+        "c": 3,
+        "h": 2,
+        "w": 2
+      },
+      "bias_int32": null,
+      "requant": null
+    }
+  ],
+  "frames": [
+    {
+      "index": 0,
+      "ops": [
+        {
+          "name": "rnd",
+          "elem": "i8",
+          "codes": [
+            -1,
+            1,
+            0,
+            -1,
+            1,
+            1,
+            1,
+            0,
+            127,
+            127,
+            127,
+            127,
+            -127,
+            -127,
+            -127,
+            -127
+          ]
+        },
+        {
+          "name": "head",
+          "elem": "u8",
+          "codes": [
+            1,
+            1,
+            1,
+            0,
+            127,
+            127,
+            127,
+            127,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "quantize_u8_output",
+          "elem": "u8",
+          "codes": [
+            1,
+            1,
+            1,
+            0,
+            127,
+            127,
+            127,
+            127,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "output_u8": [
+        1,
+        1,
+        1,
+        0,
+        127,
+        127,
+        127,
+        127,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "index": 1,
+      "ops": [
+        {
+          "name": "rnd",
+          "elem": "i8",
+          "codes": [
+            1,
+            0,
+            1,
+            0,
+            -1,
+            0,
+            1,
+            0,
+            127,
+            127,
+            127,
+            127,
+            -127,
+            -127,
+            -127,
+            -127
+          ]
+        },
+        {
+          "name": "head",
+          "elem": "u8",
+          "codes": [
+            0,
+            0,
+            1,
+            0,
+            127,
+            127,
+            127,
+            127,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "quantize_u8_output",
+          "elem": "u8",
+          "codes": [
+            0,
+            0,
+            1,
+            0,
+            127,
+            127,
+            127,
+            127,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "output_u8": [
+        0,
+        0,
+        1,
+        0,
+        127,
+        127,
+        127,
+        127,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "input_frames": [
+    {
+      "index": 0,
+      "input_codes": [
+        -2,
+        2,
+        0,
+        -2,
+        4,
+        4,
+        4,
+        2,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "input_positions": [
+        [
+          -2,
+          4,
+          0,
+          0
+        ],
+        [
+          2,
+          4,
+          0,
+          0
+        ],
+        [
+          0,
+          4,
+          0,
+          0
+        ],
+        [
+          -2,
+          2,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "index": 1,
+      "input_codes": [
+        2,
+        0,
+        4,
+        -1,
+        -4,
+        0,
+        4,
+        -1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "input_positions": [
+        [
+          2,
+          -4,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          4,
+          4,
+          0,
+          0
+        ],
+        [
+          -1,
+          -1,
+          0,
+          0
+        ]
+      ]
+    }
+  ]
+}

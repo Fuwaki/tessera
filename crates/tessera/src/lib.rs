@@ -19,9 +19,13 @@
 //! * [`frontend`] — `fpga_st_train.int8.v1` manifest import, packing checks, provenance
 //!   hashing and artifact save/load.
 //! * [`mlir`] — deterministic Graph IR to MLIR emission, the pinned Melior pass
-//!   pipeline, and the persisted [`mlir::MlirArtifact`].
-//! * [`lower`] — Graph IR to the planner's typed primitive graph, including
-//!   requantization serialization and per-channel multiplier preservation.
+//!   pipeline, the structured analysis of an optimized module, and the persisted
+//!   [`mlir::MlirArtifact`].
+//! * [`lower`] — Graph IR *and* optimized MLIR artifacts to the planner's typed
+//!   primitive graph, including requantization serialization, per-channel
+//!   multiplier preservation and the exact code interval of every activation.
+//! * [`primitive`] — the persisted primitive graph (`tessera.primitive`): the
+//!   planner input, the optimizer's fusion groups and buffers, and provenance.
 //! * [`target`] — declarative Ti60 target descriptions.
 //! * [`planner`] — layout search over execution mode, folding, fusion, placement and
 //!   granularity, producing a [`layout::LayoutArtifact`].
@@ -40,6 +44,7 @@ pub mod layout;
 pub mod lower;
 pub mod mlir;
 pub mod planner;
+pub mod primitive;
 pub mod rtl;
 pub mod stages;
 pub mod target;

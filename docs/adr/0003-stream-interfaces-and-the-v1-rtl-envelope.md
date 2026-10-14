@@ -37,7 +37,7 @@ backend was to bypass the planner — which defeats the point of a persisted pla
    everything else.** Supported: one step, `PointwiseConv2d` (or `Conv2d` with a
    1x1 kernel and `groups == 1`), `tap_parallel == 1`, no bias, signed int8
    activation/weight/output elements, weights resident in ROM, activation
-   buffers in register or FIFO, one requantization contract with half-up
+   buffers in register or FIFO, one requantization contract with half-away-from-zero
    rounding inside the 17-bit multiplier field, and an activation clamp inside
    int8. The backend enumerates the unsupported constructs in its error, naming
    the step (`unsupported layout: v1 emits exactly one kernel, but the plan has 7
