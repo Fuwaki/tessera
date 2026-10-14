@@ -426,7 +426,7 @@ fn cmd_solve(args: SolveArgs) -> Result<std::process::ExitCode> {
                 // from this stage directory) *before* staging a copy: the copy lands
                 // in the output directory, which need not hold a recorded shape.
                 let shape = resolve_input_shape(&dir, args.input_shape.as_deref(), graph)?;
-                let staged = materialize(&dir, graph, stages::GRAPH_FILE)?;
+                materialize(&dir, graph, stages::GRAPH_FILE)?;
                 copy_weight_blob(
                     &dir,
                     graph.parent().unwrap_or_else(|| Path::new(".")),
