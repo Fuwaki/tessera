@@ -5,7 +5,7 @@
 //! ```text
 //! Graph IR
 //!   -> emit_module        tensor-level linalg/arith/tensor text      (this crate, no MLIR needed)
-//!   -> optimize           bufferized memref/affine planning text     (Melior, `melior` feature)
+//!   -> optimize           bufferized memref/affine planning text     (Melior, in process)
 //!   -> MlirArtifact       versioned, inspectable, resumable artifact
 //! ```
 //!
@@ -25,35 +25,21 @@
 //!   [`optimize`] consumes a saved [`MlirArtifact`] rather than an in-memory
 //!   graph, so `tessera optimize` never re-imports or re-emits.
 //!
-//! Compile-time optionality: the whole Melior dependency sits behind the
-//! `melior` feature. Without it the crate still emits, persists and validates
-//! artifacts, and [`optimize`] returns [`MlirError::MeliorUnavailable`].
-//!
-//! Required dependency (added by integration, not by this module):
-//!
-//! ```toml
-//! [dependencies]
-//! melior = { version = "=0.28.2", optional = true }
-//!
-//! [features]
-//! melior = ["dep:melior"]
-//! ```
-//!
 //! Melior 0.28.2 pulls `mlir-sys` 230.0.2, which requires an LLVM/MLIR 23.x
 //! installation discoverable through `MLIR_SYS_230_PREFIX` (and
-//! `TABLEGEN_230_PREFIX` when ODS-generated dialect bindings are ever enabled).
+//! `TABLEGEN_230_PREFIX`).
 
 pub mod analysis;
 mod artifact;
 mod emit;
 #[cfg(test)]
-mod fixtures;
+pub(crate) mod fixtures;
 mod pipeline;
 pub mod quant;
 
 pub use analysis::{
     ANALYSIS_FORMAT, ANALYSIS_SCHEMA_VERSION, AnalysisCounts, AnalyzedBuffer, LoopNest,
-    ModuleAnalysis, OpTag, TAG_PREFIX, analysis_verification_available, analyze,
+    ModuleAnalysis, OpTag, TAG_PREFIX, analyze,
 };
 
 pub use artifact::{
@@ -68,7 +54,7 @@ pub use emit::{
     EmittedModule, TAG_ADD, TAG_CONV, TAG_EPILOGUE, TAG_PAD, TAG_UPSAMPLE, emit_module, emit_text,
 };
 pub use pipeline::{
-    OptimizationOutcome, PINNED_MELIOR_VERSION, default_pipeline, melior_available,
+    OptimizationOutcome, PINNED_MELIOR_VERSION, default_pipeline,
     render_pipeline, run_pipeline,
 };
 pub use quant::{
@@ -248,30 +234,18 @@ mod tests {
     const TRIVIAL_MODULE: &str = "module {\n  func.func @f() {\n    return\n  }\n}\n";
 
     #[test]
-    fn optimization_is_gated_and_reports_absence_truthfully() {
+    fn optimization_runs_and_records_its_provenance() {
         let artifact = tensor_stage_artifact(TRIVIAL_MODULE);
         let result = optimize(&artifact);
-        if melior_available() {
-            assert!(result.is_ok(), "{result:?}");
-            let optimized = result.unwrap();
-            assert_eq!(optimized.stage, MlirStage::Planning);
-            assert!(optimized.metrics.structural.is_some());
-            assert!(optimized.provenance.melior.is_some());
-            assert_eq!(
-                optimized.provenance.module_hash,
-                content_hash(&optimized.module)
-            );
-        } else {
-            match result {
-                Err(MlirError::MeliorUnavailable { detail }) => {
-                    assert!(
-                        detail.contains("#[cfg(feature = \"melior\")]")
-                            || detail.contains("melior 0.28.2")
-                    );
-                }
-                other => panic!("expected MeliorUnavailable, got {other:?}"),
-            }
-        }
+        assert!(result.is_ok(), "{result:?}");
+        let optimized = result.unwrap();
+        assert_eq!(optimized.stage, MlirStage::Planning);
+        assert!(optimized.metrics.structural.is_some());
+        assert!(optimized.provenance.melior.is_some());
+        assert_eq!(
+            optimized.provenance.module_hash,
+            content_hash(&optimized.module)
+        );
     }
 
     #[test]

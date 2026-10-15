@@ -15,10 +15,6 @@
 //! `convert-linalg-to-affine-loops`,
 //! `affine-loop-fusion{mode=producer}`, `canonicalize`, `cse`, and this module
 //! has no way to insert tensor-level fusion before bufferization.
-//!
-//! Without the `melior` feature the module still renders and validates the
-//! pipeline, and [`run_pipeline`] reports [`MlirError::MeliorUnavailable`]
-//! instead of pretending to optimize.
 
 use super::artifact::{MlirError, PipelineStage};
 use std::fmt;
@@ -108,12 +104,6 @@ impl fmt::Display for OptimizationOutcome {
     }
 }
 
-/// Whether this build can execute MLIR passes in process.
-pub const fn melior_available() -> bool {
-    cfg!(feature = "melior")
-}
-
-#[cfg(feature = "melior")]
 mod imp {
     use super::*;
     use melior::Context;
@@ -194,25 +184,6 @@ mod imp {
     }
 }
 
-#[cfg(not(feature = "melior"))]
-mod imp {
-    use super::*;
-
-    /// A build without the `melior` feature validates the pipeline but refuses
-    /// to claim it optimized anything.
-    pub fn run_pipeline(
-        _source: &str,
-        stages: &[PipelineStage],
-    ) -> Result<OptimizationOutcome, MlirError> {
-        let pipeline = render_pipeline(stages)?;
-        Err(MlirError::MeliorUnavailable {
-            detail: format!(
-                "this build has no `melior` feature: rebuild with `--features melior` against melior {PINNED_MELIOR_VERSION} to run `{pipeline}`"
-            ),
-        })
-    }
-}
-
 pub use imp::run_pipeline;
 
 #[cfg(test)]
@@ -255,25 +226,13 @@ mod tests {
     }
 
     #[test]
-    fn gated_pipeline_reports_availability_truthfully() {
-        if melior_available() {
-            let outcome = run_pipeline("module {}", &default_pipeline());
-            assert!(outcome.is_ok(), "{outcome:?}");
-        } else {
-            match run_pipeline("module {}", &default_pipeline()) {
-                Err(MlirError::MeliorUnavailable { detail }) => {
-                    assert!(detail.contains(PINNED_MELIOR_VERSION), "{detail}");
-                }
-                other => panic!("expected MeliorUnavailable, got {other:?}"),
-            }
-        }
+    fn the_pinned_pipeline_runs_in_process() {
+        let outcome = run_pipeline("module {}", &default_pipeline());
+        assert!(outcome.is_ok(), "{outcome:?}");
     }
 
     #[test]
     fn malformed_module_is_rejected_before_optimization() {
-        if !melior_available() {
-            return;
-        }
         let result = run_pipeline("module { func.func @broken( }", &default_pipeline());
         assert!(
             matches!(result, Err(MlirError::Melior { .. })),

@@ -16,19 +16,18 @@
 //!
 //! * [`graph`] — typed, target-independent graph IR, validation, metrics and the
 //!   persisted [`graph::GraphArtifact`].
+//! * [`dialect`] — IRDL-defined tessera hardware-mapping dialect and verifier.
 //! * [`frontend`] — `fpga_st_train.int8.v1` manifest import, packing checks, provenance
 //!   hashing and artifact save/load.
 //! * [`mlir`] — deterministic Graph IR to MLIR emission, the pinned Melior pass
 //!   pipeline, the structured analysis of an optimized module, and the persisted
 //!   [`mlir::MlirArtifact`].
-//! * [`lower`] — Graph IR *and* optimized MLIR artifacts to the planner's typed
-//!   primitive graph, including requantization serialization, per-channel
-//!   multiplier preservation and the exact code interval of every activation.
-//! * [`primitive`] — the persisted primitive graph (`tessera.primitive`): the
-//!   planner input, the optimizer's fusion groups and buffers, and provenance.
+//! * [`lower`] — shared lowering helpers (element ranges, weight/bias names);
+//!   the planner input is built from tessera dialect ops via [`solver`].
+//! * [`dialect`] — tessera IRDL ops, linalg→tessera conversion, verifier.
 //! * [`target`] — declarative Ti60 target descriptions.
-//! * [`planner`] — layout search over execution mode, folding, fusion, placement and
-//!   granularity, producing a [`layout::LayoutArtifact`].
+//! * [`plan`] — policy vocabulary shared with the solver.
+//! * [`planner`] — legacy candidate search (being removed; prefer [`solver`]).
 //! * [`layout`] — the persisted layout, its validation, and the backend-ready
 //!   [`layout::ExecutionPlan`] projection.
 //! * [`weights`] — weight-byte resolution for the RTL backend, including the concrete
@@ -38,13 +37,14 @@
 //! * [`stages`] — the persistent stage directory, artifact detection and the
 //!   cross-stage provenance checks used by `tessera verify`.
 
+pub mod dialect;
 pub mod frontend;
 pub mod graph;
 pub mod layout;
 pub mod lower;
 pub mod mlir;
+pub mod plan;
 pub mod planner;
-pub mod primitive;
 pub mod rtl;
 pub mod solver;
 pub mod stages;

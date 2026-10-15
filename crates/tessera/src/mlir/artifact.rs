@@ -7,7 +7,7 @@
 //! semantics the planner and RTL backends bind to, and provenance.
 //!
 //! Nothing here runs MLIR. The artifact is produced by [`crate::mlir::emit`]
-//! and, when the `melior` feature is enabled, replaced by the
+//! and replaced by the
 //! planning-stage module produced by [`crate::mlir::pipeline`].
 
 use serde::{Deserialize, Serialize};
@@ -940,9 +940,7 @@ impl MlirArtifact {
     ///
     /// This is the check that binds a plan to its module: the recorded analysis
     /// cannot satisfy it by editing metadata, because it is recomputed from the
-    /// module text. In a build without the `melior` feature the re-derivation is
-    /// impossible, and the check fails loudly rather than passing on metadata
-    /// that was never verified.
+    /// module text.
     fn verify_rederived_analysis(&self, recorded: &ModuleAnalysis) -> ProvenanceCheck {
         match self.reanalyze() {
             Ok(derived) => {
@@ -973,8 +971,8 @@ impl MlirArtifact {
                 check: "analysis matches the re-derived structure".to_string(),
                 ok: false,
                 detail: format!(
-                    "the analysis cannot be re-derived ({error}); this build cannot verify an \
-                     embedded analysis, so it does not report one as verified"
+                    "the analysis cannot be re-derived ({error}); the embedded analysis is \
+                     not reported as verified"
                 ),
             },
         }
@@ -988,9 +986,6 @@ impl MlirArtifact {
     /// `buffers` or `operations` map is caught here even if it kept the recorded
     /// `module_hash`. A module with dynamically shaped allocations is refused
     /// too: planning needs shapes whose size is known.
-    ///
-    /// Without the `melior` feature the analysis cannot be re-derived at all, so
-    /// this errors instead of lowering from unverified metadata.
     pub fn analyzed(&self) -> Result<&ModuleAnalysis, MlirError> {
         let analysis = self.analysis.as_ref().ok_or_else(|| MlirError::Analysis {
             detail: format!(
@@ -1157,8 +1152,6 @@ pub enum MlirError {
     Emission { detail: String },
     /// A pass pipeline could not be built.
     Pipeline { detail: String },
-    /// Optimization was requested from a build without the `melior` feature.
-    MeliorUnavailable { detail: String },
     /// Melior reported a parse, verification or pass failure.
     Melior { detail: String },
     /// Artifact format or schema mismatch.
@@ -1183,9 +1176,6 @@ impl fmt::Display for MlirError {
             MlirError::Shape { detail } => write!(f, "shape error: {detail}"),
             MlirError::Emission { detail } => write!(f, "MLIR emission error: {detail}"),
             MlirError::Pipeline { detail } => write!(f, "pass pipeline error: {detail}"),
-            MlirError::MeliorUnavailable { detail } => {
-                write!(f, "Melior optimization unavailable: {detail}")
-            }
             MlirError::Melior { detail } => write!(f, "Melior error: {detail}"),
             MlirError::IncompatibleArtifact { detail } => write!(f, "artifact mismatch: {detail}"),
             MlirError::Provenance { detail } => write!(f, "provenance: {detail}"),

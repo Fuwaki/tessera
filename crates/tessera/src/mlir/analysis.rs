@@ -18,9 +18,6 @@
 //! MLIR preserves that location through bufferization, loop lowering and loop
 //! fusion. An operation whose tag the analyzer does not recognize is counted as
 //! unattributed and reported, never interpreted.
-//!
-//! Without the `melior` feature there is no analyzer: [`analyze`] reports
-//! [`MlirError::MeliorUnavailable`] rather than parsing text with ad-hoc rules.
 
 use super::artifact::{MlirError, PipelineStage, StructuralMetrics};
 use serde::{Deserialize, Serialize};
@@ -337,22 +334,7 @@ fn count_diff(
     diffs
 }
 
-/// Whether this build can re-derive and verify a module's structured analysis.
-///
-/// Only a build with the `melior` feature can: without it there is no analyzer
-/// that can see loop nesting or buffer types, so analysis verification must fail
-/// loudly rather than pass on unverified metadata (`docs/developer-setup.md`
-/// describes the toolchain).
-pub const fn analysis_verification_available() -> bool {
-    cfg!(feature = "melior")
-}
-
-/// Analyze a module with Melior.
-///
-/// With the `melior` feature this parses the text, verifies it, and walks it.
-/// Without the feature it refuses, because a text scanner cannot see loop
-/// nesting or buffer types and would have to guess.
-#[cfg(feature = "melior")]
+/// Analyze a module with Melior: parse the text, verify it, and walk it.
 pub fn analyze(
     module: &str,
     melior_version: &str,
@@ -361,23 +343,6 @@ pub fn analyze(
     imp::analyze(module, melior_version, pipeline)
 }
 
-/// See the `melior` implementation; this build cannot analyze a module.
-#[cfg(not(feature = "melior"))]
-pub fn analyze(
-    module: &str,
-    melior_version: &str,
-    pipeline: &[PipelineStage],
-) -> Result<ModuleAnalysis, MlirError> {
-    let _ = (module, melior_version, pipeline);
-    Err(MlirError::MeliorUnavailable {
-        detail: "structured module analysis needs the `melior` feature (see \
-                 docs/developer-setup.md); no textual fallback is used because loop nesting \
-                 and buffer types are not recoverable from text without guessing"
-            .to_string(),
-    })
-}
-
-#[cfg(feature = "melior")]
 mod imp {
     use super::*;
     use melior::Context;

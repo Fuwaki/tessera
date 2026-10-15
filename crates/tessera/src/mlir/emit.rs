@@ -620,6 +620,10 @@ impl<'g> Emitter<'g> {
                 out_shape: &out_shape,
                 requant: &requant,
                 tag: &format!("{TAG_EPILOGUE}#{index}"),
+                annotation: &conv_annotation(
+                    index, &layer_name, kind, kernel, stride, pad_amount,
+                    matches!(padding, PaddingSpec::Reflect { .. }), groups, &requant,
+                ),
             },
         );
         self.body.push_str(&text);
@@ -739,10 +743,14 @@ impl<'g> Emitter<'g> {
                 ),
             });
         }
-        if trunk.element != ElementType::I8 || branch.element != ElementType::I8 {
+        let ok = |e: ElementType| matches!(e, ElementType::I8 | ElementType::I16);
+        if !ok(trunk.element) || !ok(branch.element) {
             return Err(MlirError::Unsupported {
                 feature: "add".to_string(),
-                detail: format!("graph[{index}]: add operands must be i8 activations"),
+                detail: format!(
+                    "graph[{index}]: add operands must be i8/i16 activations, got {:?} and {:?}",
+                    trunk.element, branch.element
+                ),
             });
         }
 
@@ -807,6 +815,7 @@ impl<'g> Emitter<'g> {
                 branch_element: branch.element,
                 result_element: out_element,
                 tag: &format!("{TAG_ADD}#{index}"),
+                annotation: &add_annotation(index, &spec, out_range),
             },
         );
         self.body.push_str(&text);
@@ -884,6 +893,7 @@ impl<'g> Emitter<'g> {
                 out_shape: &out_shape,
                 element: source.element,
                 tag: &format!("{TAG_UPSAMPLE}#{index}"),
+                annotation: &format!(", tessera.op = {{kind = \"nearest_upsample2x\", index = {index} : i64, scale = 2 : i64, range = array<i64: {}, {}>}}", source.code_range.lo, source.code_range.hi),
             },
         );
         self.body.push_str(&text);
@@ -1070,7 +1080,29 @@ impl<'g> Emitter<'g> {
             );
         }
         let result_type = tensor_type(&output.shape, output.element);
-        let _ = write!(signature, ") -> {result_type} {{\n");
+        // Module-level facts the tessera dialect needs that no single op owns:
+        // the graph input code interval, and the unsigned output step that the
+        // head epilogue already applies.
+        let mut facts = vec![format!(
+            "tessera.input_range = array<i64: {}, {}>",
+            self.input.code_range.lo, self.input.code_range.hi
+        )];
+        if let Some(quantize) = self
+            .operators
+            .iter()
+            .find(|op| op.kind == OperatorKind::QuantizeU8)
+        {
+            facts.push(format!(
+                "tessera.quantize_output = {{index = {} : i64, clamp = array<i64: 0, {}>}}",
+                quantize.index,
+                output.code_range.hi.max(0)
+            ));
+        }
+        let _ = write!(
+            signature,
+            ") -> {result_type} attributes {{{}}} {{\n",
+            facts.join(", ")
+        );
         text.push_str(&signature);
         if self.needs_zero_i32 {
             push_line(&mut text, 2, "%zero_i32 = arith.constant 0 : i32");
@@ -1560,6 +1592,8 @@ fn write_pad(
 }
 
 struct ConvEpilogue<'a> {
+    /// `tessera.op` annotation: the operator's semantics as attributes.
+    annotation: &'a str,
     result: &'a str,
     result_init: &'a str,
     accumulator: &'a str,
@@ -1575,6 +1609,47 @@ struct ConvEpilogue<'a> {
 /// Requantization and saturation epilogue of a convolution.
 ///
 /// `%acc_b = acc + bias_int32`, then the `(M0, shift)` fixed point multiply with
+
+/// `tessera.op` annotation of a convolution: everything the tessera lowering
+/// needs that is not already carried by SSA operands and tensor types.
+#[allow(clippy::too_many_arguments)]
+fn conv_annotation(
+    index: usize,
+    name: &str,
+    kind: PlannerKind,
+    kernel: [u64; 2],
+    stride: [u64; 2],
+    pad: u32,
+    reflect: bool,
+    groups: u32,
+    requant: &Quantization,
+) -> String {
+    let kind = match kind {
+        PlannerKind::Conv2d => "conv2d",
+        PlannerKind::PointwiseConv2d => "pointwise_conv2d",
+        PlannerKind::DepthwiseConv2d => "depthwise_conv2d",
+    };
+    format!(
+        ", tessera.op = {{kind = \"{kind}\", name = \"{name}\", index = {index} : i64, \
+         kernel = array<i64: {}, {}>, stride = array<i64: {}, {}>, pad = {pad} : i64, \
+         reflect = {reflect}, groups = {groups} : i64, shift = {} : i64, \
+         clamp = array<i64: {}, {}>, multiplier = array<i64: {}>}}",
+        kernel[0], kernel[1], stride[0], stride[1], requant.shift,
+        requant.clamp.lower, requant.clamp.upper,
+        requant.multiplier.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(", ")
+    )
+}
+
+/// `tessera.op` annotation of a residual add (branch requantized, sum unclamped).
+fn add_annotation(index: usize, spec: &RequantSpec, range: CodeRange) -> String {
+    let m: Vec<String> = spec.multiplier.iter().map(|m| m.to_string()).collect();
+    format!(
+        ", tessera.op = {{kind = \"add\", index = {index} : i64, multiplier = array<i64: {}>, \
+         shift = {} : i64, clamp = array<i64: {}, {}>, range = array<i64: {}, {}>}}",
+        m.join(", "), spec.shift, spec.clamp.lower, spec.clamp.upper, range.lo, range.hi
+    )
+}
+
 /// round-half-away-from-zero, then the saturation clamp.
 fn write_conv_epilogue(text: &mut String, indent: usize, epilogue: &ConvEpilogue<'_>) {
     let acc_type = tensor_type(epilogue.acc_shape, ElementType::I32);
@@ -1590,7 +1665,7 @@ fn write_conv_epilogue(text: &mut String, indent: usize, epilogue: &ConvEpilogue
         text,
         indent,
         &format!(
-            "{result} = linalg.generic {{indexing_maps = [{maps}], iterator_types = {iters}}} ins({acc}, {bias}, {m0} : {acc_type}, {channel_type}, {channel_type}) outs({init} : {out_type}) {{",
+            "{result} = linalg.generic {{indexing_maps = [{maps}], iterator_types = {iters}{ann}}} ins({acc}, {bias}, {m0} : {acc_type}, {channel_type}, {channel_type}) outs({init} : {out_type}) {{",
             result = ssa(epilogue.result),
             maps = maps.join(", "),
             iters = parallel_iters(4),
@@ -1598,6 +1673,7 @@ fn write_conv_epilogue(text: &mut String, indent: usize, epilogue: &ConvEpilogue
             bias = ssa(epilogue.bias),
             m0 = ssa(epilogue.multiplier),
             init = ssa(epilogue.result_init),
+            ann = epilogue.annotation,
         ),
     );
     let block = indent + 1;
@@ -1627,6 +1703,8 @@ fn write_conv_epilogue(text: &mut String, indent: usize, epilogue: &ConvEpilogue
 }
 
 struct AddOp<'a> {
+    /// `tessera.op` annotation: the operator's semantics as attributes.
+    annotation: &'a str,
     result: &'a str,
     result_init: &'a str,
     trunk: &'a str,
@@ -1654,13 +1732,14 @@ fn write_add(text: &mut String, indent: usize, op: &AddOp<'_>) {
         text,
         indent,
         &format!(
-            "{result} = linalg.generic {{indexing_maps = [{maps}], iterator_types = {iters}}} ins({trunk}, {branch} : {trunk_ty}, {branch_ty}) outs({init} : {ty}) {{",
+            "{result} = linalg.generic {{indexing_maps = [{maps}], iterator_types = {iters}{ann}}} ins({trunk}, {branch} : {trunk_ty}, {branch_ty}) outs({init} : {ty}) {{",
             result = ssa(op.result),
             maps = maps.join(", "),
             iters = parallel_iters(4),
             trunk = ssa(op.trunk),
             branch = ssa(op.branch),
             init = ssa(op.result_init),
+            ann = op.annotation,
         ),
     );
     let block = indent + 1;
@@ -1885,14 +1964,18 @@ struct GenericConv<'a> {
 fn write_generic_conv(text: &mut String, indent: usize, op: &GenericConv<'_>, tag: &str) {
     let source_type = tensor_type(op.source_shape, op.element);
     let filter_type = tensor_type(op.filter_shape, ElementType::I8);
-    let (input_map, filter_map) = match op.kind {
+    // Depthwise has no in-channel reduction: iterators are
+    // (N, OH, OW, C, KH, KW). Dense/pointwise add an Ic reduction as d6.
+    let (input_map, filter_map, output_map, iters) = match op.kind {
         PlannerKind::DepthwiseConv2d => (
             format!(
-                "affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d0, d1 * {sh} + d4, d2 * {sw} + d5, d3)>",
+                "affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1 * {sh} + d4, d2 * {sw} + d5, d3)>",
                 sh = op.stride[0],
                 sw = op.stride[1],
             ),
-            "affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d4, d5, d3)>".to_string(),
+            "affine_map<(d0, d1, d2, d3, d4, d5) -> (d4, d5, d3)>".to_string(),
+            "affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d3)>".to_string(),
+            r#"["parallel", "parallel", "parallel", "parallel", "reduction", "reduction"]"#.to_string(),
         ),
         PlannerKind::Conv2d | PlannerKind::PointwiseConv2d => (
             format!(
@@ -1901,17 +1984,17 @@ fn write_generic_conv(text: &mut String, indent: usize, op: &GenericConv<'_>, ta
                 sw = op.stride[1],
             ),
             "affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d3, d4, d5, d6)>".to_string(),
+            "affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d0, d1, d2, d3)>".to_string(),
+            r#"["parallel", "parallel", "parallel", "parallel", "reduction", "reduction", "reduction"]"#.to_string(),
         ),
     };
-    let output_map = "affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d0, d1, d2, d3)>";
-    let iters = r#"["parallel", "parallel", "parallel", "parallel", "reduction", "reduction", "reduction"]"#;
     push_line(
         text,
         indent,
         &format!(
             "{result} = linalg.generic {{indexing_maps = [{maps}], iterator_types = {iters}}} ins({source}, {filter} : {source_type}, {filter_type}) outs({init} : {acc}) {{",
             result = ssa(op.result),
-            maps = [input_map, filter_map, output_map.to_string()].join(", "),
+            maps = [input_map, filter_map, output_map].join(", "),
             source = ssa(op.source),
             filter = ssa(op.filter),
             init = ssa(op.result_init),
@@ -1952,6 +2035,8 @@ fn write_generic_conv(text: &mut String, indent: usize, op: &GenericConv<'_>, ta
 }
 
 struct Upsample<'a> {
+    /// `tessera.op` annotation: the operator's semantics as attributes.
+    annotation: &'a str,
     result: &'a str,
     result_init: &'a str,
     source: &'a str,
@@ -1979,12 +2064,13 @@ fn write_upsample(text: &mut String, indent: usize, op: &Upsample<'_>) {
         text,
         indent,
         &format!(
-            "{result} = linalg.generic {{indexing_maps = [{maps}], iterator_types = {iters}}} ins({source} : {in_type}) outs({init} : {out_type}) {{",
+            "{result} = linalg.generic {{indexing_maps = [{maps}], iterator_types = {iters}{ann}}} ins({source} : {in_type}) outs({init} : {out_type}) {{",
             result = ssa(op.result),
             maps = maps.join(", "),
             iters = parallel_iters(4),
             source = ssa(op.source),
             init = ssa(op.result_init),
+            ann = op.annotation,
         ),
     );
     let block = indent + 1;
@@ -2230,6 +2316,7 @@ mod tests {
             &mut text,
             2,
             &ConvEpilogue {
+                annotation: "",
                 result: "enc_0__out",
                 result_init: "enc_0__out_init",
                 accumulator: "enc_0__acc",
@@ -2259,6 +2346,7 @@ mod tests {
             &mut text,
             2,
             &ConvEpilogue {
+                annotation: "",
                 result: "head__out",
                 result_init: "head__out_init",
                 accumulator: "head__acc",
@@ -2286,6 +2374,7 @@ mod tests {
             &mut text,
             2,
             &AddOp {
+                annotation: "",
                 result: "add_3__out",
                 result_init: "add_3__init",
                 trunk: "up3_1__out",
@@ -2316,6 +2405,7 @@ mod tests {
             &mut text,
             2,
             &Upsample {
+                annotation: "",
                 result: "up_5__out",
                 result_init: "up_5__init",
                 source: "up3_1__out",
