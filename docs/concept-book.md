@@ -52,15 +52,16 @@ Tessera is not a single command that transforms a model directly into RTL. It is
 model description
     ↓ import
 graph artifact
-    ↓ MLIR optimize / progressively lower
-optimized graph artifact
-    ↓ target constraints + layout search
-layout artifact
-    ↓ plan validation / schedule materialization
-execution-plan artifact
-    ↓ RTL lowering
-RTL artifact bundle
-    ↓ simulation / synthesis / board validation
+    ↓ emit-mlir / optional Melior optimize
+tensor-level MLIR (linalg)
+    ↓ lower / annotate → tessera dialect
+tessera dialect module
+    ↓ CP-SAT on dialect (engine / bind / buffer / segment / schedule)
+solved tessera module (+ layout artifact)
+    ↓ CIRCT lower (hw / comb / sv) in the same Melior context
+    ↓ in-process ExportVerilog
+RTL artifact bundle (`*_sched_core` datapath)
+    ↓ Verilator bit-exact / synthesis / board validation
 measurement artifacts
 ```
 
@@ -70,12 +71,12 @@ The stages are:
 
 1. **Import** — parse ONNX or manifest into target-independent Graph IR.
 2. **Graph optimization** — canonicalize, fuse, eliminate copies, and preserve numerical semantics through MLIR.
-3. **Progressive lowering** — expose tensors, buffers, loops, and primitive operations while retaining Tessera hardware-relevant attributes.
+3. **Tessera dialect** — lower / annotate tensor MLIR into Tessera operator ops that carry quantization and shape contracts.
 4. **Constraint loading** — parse a user-editable target and policy description.
-5. **Layout search** — explore execution mode, folding, fusion, tile/row granularity, memory placement, and engine assignment.
-6. **Layout materialization** — save the selected layout and resource/cycle/bandwidth report.
-7. **RTL lowering** — convert only a validated layout into RTL, memories, schedule tables, and driver metadata.
-8. **Verification and measurement** — run semantic simulation, RTL simulation, synthesis, and optional board validation.
+5. **CP-SAT mapping solve** — jointly decide engine count, operator binds, fold, schedule, pipeline cuts and arena placement; write `tessera.engine` / `bind` / `buffer` / `segment` / `schedule` back into the same module.
+6. **Layout materialization** — save the selected layout and resource/cycle/bandwidth report beside `solved.mlir`.
+7. **RTL lowering** — CIRCT `hw`/`comb`/`sv` from the solved module, then in-process ExportVerilog; the DUT datapath is a single integer `*_sched_core`.
+8. **Verification and measurement** — run semantic simulation, Verilator bit-exact checks, synthesis, and optional board validation.
 
 The term **layout** means the hardware organization and placement of computation/data, not FPGA physical placement and routing. Physical placement remains a downstream Efinity/toolchain result.
 
@@ -87,11 +88,9 @@ The CLI exposes explicit stage commands rather than hiding the pipeline behind o
 tessera import    manifest.json|dir --input-shape N,H,W,C --out build/
 tessera emit-mlir build/graph.tgraph --out build/
 tessera optimize  build/mlir.json --out build/          # requires the `melior` feature
-tessera solve     --graph build/graph.tgraph --target ti60.toml --policy p.toml --out build/
-tessera solve     --primitive primitive.json --target ti60.toml --policy p.toml --out build/
+tessera solve     --tessera build/tessera.mlir --target ti60.toml --policy p.toml --out build/
 tessera inspect   build/graph.tgraph | build/mlir.json | build/layout.tlayout | build/rtl/rtl_bundle.json
-tessera emit      build/layout.tlayout --graph build/graph.tgraph --out build/
-tessera simulate  build/layout.tlayout --weights DIR --out build/
+tessera emit      --tessera build/solved.mlir --graph build/graph.tgraph --out build/
 tessera verify    build/
 ```
 
@@ -285,29 +284,35 @@ engines, bindings, folds, schedule, pipeline cuts and arena placement into a
 solver-agnostic model and hands it to CP-SAT in process, which is the "after the
 cost model and plan schema stabilize" step described here.
 
-## 8. RTL backends
+## 8. RTL emission (CIRCT hybrid)
 
-Backends consume the same Execution Plan but may emit different structures:
+The only emit path is the CIRCT hybrid kernel (`tessera.hybrid.circt.v1`):
 
-### Dedicated backend
+```text
+solved tessera dialect
+    → CIRCT (`hw` / `comb` / `sv`) in the same Melior context
+    → in-process ExportVerilog
+    → rtl/ bundle + optional self-checking Verilator testbench
+```
 
-Generates operator-specialized FSM/stream hardware. This preserves the useful NNgen-style baseline.
+### Datapath
 
-### Streaming backend
+The DUT has a **single integer datapath**, `*_sched_core`:
 
-Generates ready/valid layers from the existing `st_stream` primitive library: windows, depthwise, MVAU, requant, FIFO, and ROM.
+- weight and requant ROMs filled from the graph / weight blob when `--graph` is passed;
+- i16×i8 MAC accumulation;
+- integer requant `(acc * M0 + round) >>> shift` with half-away-from-zero rounding and clamp;
+- residual `add` and nearest upsample.
 
-### Shared-tile backend
+Bit-exact simulation compares the DUT against the same integer evaluator used to build the testbench expected vectors (`circt_data::evaluate_integer`).
 
-Generates a configurable MAC engine, tile buffers, line buffers, DMA, ping-pong control, and a static schedule engine. This is the primary new backend.
+### Engines and binds
 
-### Implemented in v1
+Solved `tessera.engine` and `tessera.bind` ops are **mapping decisions** recorded in the dialect by CP-SAT (how many engines, which op runs on which engine, fold and schedule). They are **not** emitted as separate per-engine FSMs today. On the DUT they appear as `engines_busy`: a one-hot of the engine that owns the schedule core's current op while the core is busy. Real per-engine microarchitecture is deferred; do not read `engines_busy` as evidence of independent engine hardware.
 
-The emitted backend (`tessera.pw_dot.i8i8.v1`) is a narrow, streaming pointwise-dot kernel with a ready/valid interface, a folded weight ROM and a per-channel requantization ROM. It emits **exactly one kernel**: a single pointwise step with signed int8 activations, no bias, and streamed activation buffers. Everything outside that envelope is rejected by step name, with the unsupported construct named — a multi-step plan, a depthwise or non-1x1 kernel, `add`, standalone requant/activation, upsampling, unsigned output, bias terms, shared-tile/hybrid engines, non-stream activation buffers, or requantization outside the 17-bit multiplier field. A layout that the backend cannot emit is a planning result to be revisited, never a silently altered plan (ADR-0003).
+### Fail closed
 
-For this reason a whole-model layout (for example the W8 example's seven steps) solves successfully and is then rejected at `emit` with the full step list. The narrow envelope is reachable end to end from a pointwise plan, which `fixtures/pointwise` demonstrates, and simulation is verified against the Rust reference model when Verilator is available.
-
-The backends share semantics and plan validation, not necessarily RTL implementation details.
+`emit --tessera` requires a solved module with resolved ops for content-filled emission. Layout-based backends (`pw_dot`, full-graph, mapped) are retired on this branch; calling `emit` with only a `layout.tlayout` fails with a pointer to the CIRCT path. A layout or dialect module the backend cannot emit is returned to the user unchanged — never silently rewritten.
 
 ## 9. Verification
 
@@ -355,54 +360,7 @@ crates/tessera/
 
 The current repository begins as one crate to keep iteration cheap; modules may become workspace crates once interfaces stabilize.
 
-## 11. Initial milestones
-
-### M0: repository and contracts
-
-- Rust workspace and CLI.
-- Versioned plan schema.
-- Manifest parsing for the current export.
-- Golden vector import.
-
-### M1: semantic graph
-
-- Graph IR for the initial operator set.
-- Shape, layout, quantization, and padding validation.
-- Reference evaluator for deterministic small tensors.
-
-### M2: MLIR lowering
-
-- Manifest → Tessera MLIR.
-- Stable quantization attributes.
-- DW→requant→PW fusion legality and equivalence check.
-- Buffer and loop lowering.
-
-### M3: Ti60 planner
-
-- Target resource model.
-- Candidate folding and buffer placement.
-- Cycle, RAM, DSP, and DDR estimates.
-- Feasibility and Pareto report.
-
-### M4: first RTL backend
-
-- Shared tile kernel for one DW→PW block.
-- BRAM ping-pong and fixed schedule.
-- SystemVerilog generation.
-- Verilator test against the fixed-point reference.
-
-### M5: closed loop
-
-- Full initial model.
-- Efinity synthesis report parser.
-- Cost-model calibration.
-- Board integration without per-layer CPU scheduling.
-
-### Status at v0.1
-
-M1-M3 are implemented: the graph IR and manifest frontend, deterministic MLIR emission (with in-process optimization behind the optional `melior` feature), the Ti60 target model and layout search, and the persisted stage artifacts with cross-stage provenance verification. M4 is implemented for a deliberately narrow envelope — one streaming pointwise-dot kernel with a Verilator test against the fixed-point reference — and rejects the rest of the plan space by name, so M5 (whole-model RTL, synthesis reports, board measurement) remains open. DMA scheduling and the shared-tile backend are not implemented.
-
-## 12. Non-goals and risks
+## 11. Non-goals and risks
 
 ### Risks
 
@@ -422,7 +380,7 @@ M1-M3 are implemented: the graph IR and manifest frontend, deterministic MLIR em
 - Preserve old NNgen/st_stream paths as temporary oracles.
 - Add target and backend interfaces before adding more operators.
 
-## 13. Naming and positioning
+## 12. Naming and positioning
 
 Tessera is intentionally neutral: it describes composition of tiles and does not lock the project to Efinix, one dataflow style, or one IR. The public description should be:
 

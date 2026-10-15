@@ -20,8 +20,8 @@ reproduce it, and — explicitly — what it does not prove.
 | `primitives.json` | `tessera.primitive` (JSON) | `solve --mlir` | The same plan plus its evidence: code intervals per activation tensor, loop groups mapped to operators (with fused nests), materialized buffers, and MLIR provenance |
 | `target.toml`, `policy.toml` | `tessera.target` / `tessera.policy` | `solve` | Copies of the constraints the layout was solved against, so the recorded hashes can be re-checked later |
 | `layout.tlayout` | `tessera.layout` (TOML) | `solve` | The selected organization, schedule, buffers, resource estimate and slack, per-mode rejection summary, search statistics, `certainty`, and provenance |
-| `plan.tplan` | `tessera.execution_plan` (TOML) | `solve`, `emit`, `simulate` | Backend-ready projection of the layout: steps, buffers, weight references, cycle breakdown |
-| `rtl/` | bundle | `emit`, `simulate` | SystemVerilog, self-checking testbench, memory images, bundle metadata (`rtl_bundle.json`), a reproduce script |
+| `solved.mlir` | Tessera dialect (MLIR text) | `solve --tessera` | Dialect with engine / bind / buffer / segment / schedule decisions |
+| `rtl/` | bundle | `emit --tessera` | CIRCT ExportVerilog SystemVerilog, self-checking testbench, bundle metadata (`rtl_bundle.json`), reproduce script |
 | `sim/` | Verilator work dir | `simulate` | Compiled model, simulator log, and the trace the testbench dumps |
 
 The **code interval** recorded next to each activation tensor is what sizes the
@@ -57,7 +57,7 @@ $TESSERA emit-mlir build/w8/graph.tgraph --out build/w8
 $TESSERA solve --graph build/w8/graph.tgraph \
     --target fixtures/targets/ti60f225.toml \
     --policy fixtures/policies/emit.toml --out build/w8
-$TESSERA emit build/w8/layout.tlayout --graph build/w8/graph.tgraph --out build/w8
+$TESSERA emit --tessera build/w8/solved.mlir --graph build/w8/graph.tgraph --out build/w8
 $TESSERA simulate build/w8/layout.tlayout --graph build/w8/graph.tgraph --out build/w8
 $TESSERA verify build/w8
 
@@ -75,16 +75,15 @@ $TESSERA import fixtures/ink_dw --input-shape 1,16,16,3 --out build/ink
 $TESSERA solve --graph build/ink/graph.tgraph \
     --target fixtures/targets/ti60f225.toml \
     --policy fixtures/policies/emit.toml --out build/ink
-$TESSERA emit build/ink/layout.tlayout --graph build/ink/graph.tgraph --out build/ink
+$TESSERA emit --tessera build/ink/solved.mlir --graph build/ink/graph.tgraph --out build/ink
 $TESSERA verify build/ink
 ```
 
-`fixtures/policies/emit.toml` is the policy shaped to the emitted backend: one
-shared-tile engine over an on-chip activation arena, frame granularity,
-`tap_parallel == 1` and at most 64 MAC lanes per convolution step. The generic
+`fixtures/policies/emit.toml` is the policy shaped for the CIRCT hybrid solve
+(frame granularity, lane bounds the CP-SAT mapping respects). The generic
 `streaming.toml` and `explore.toml` policies are deliberately unconstrained, so
-the difference between "the best plan the planner can find" and "a plan the
-backend can emit" stays visible instead of being hidden by the fixture.
+the difference between "the best mapping the solver can find" and "a mapping the
+`*_sched_core` path can emit" stays visible instead of being hidden by the fixture.
 
 ## What `verify` does and does not prove
 
@@ -128,8 +127,8 @@ structure, which is why both are printed together.
 | activation arena | 1404 words x 16 bits = 2808 bytes (~3 RAM10 of 10 240 bits), budget 1404, without reuse 2124 | generated vs plan |
 | MACs | 1 lane, 7488 MACs per frame | generated |
 | cycles | 9770 unstalled generated vs 10 785 plan estimate | generated vs estimate |
-| RTL simulation | 2 frames, 3852 checks, 0 mismatches, 26 473 cycles | Verilator 5.052 |
-| per-step trace | 3112 lines, 7 step blocks, 8677 bytes | emitted testbench |
+| RTL simulation | CIRCT `*_sched_core`, bit-exact vs integer ref (0 mismatches) | Verilator |
+| busy one-hot | `engines_busy` reflects bind decisions (no per-engine FSMs) | emitted DUT |
 
 **Real ink_dw, 29 layers / 61 graph ops / 37 steps** (`fixtures/policies/emit.toml`,
 input `1,8,8,3`):
@@ -141,8 +140,8 @@ input `1,8,8,3`):
 | activation arena | 4608 words x 16 bits, budget 4608, without reuse 21 056 | generated vs plan |
 | MACs | 1 lane, 399 104 MACs per frame | generated |
 | cycles | 407 114 unstalled generated vs 491 424 plan estimate | generated vs estimate |
-| RTL simulation | 2 frames, 0 mismatches | Verilator 5.052 |
-| per-step trace | 21 678 lines, 37 step blocks, 51 843 bytes | emitted testbench |
+| RTL simulation | CIRCT hybrid path when solved + emitted | Verilator |
+| busy one-hot | bind → `engines_busy` | emitted DUT |
 
 **Resolution sweep** for the same real model (limits: 152 DSP48, 88 RAM10,
 40 568 XLR; every result is a complete or proven-infeasible search, never

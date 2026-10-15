@@ -2,7 +2,15 @@
 
 ## Status
 
-Accepted
+Superseded (RTL envelope)
+
+The stream-interface buffer rule in Decision (1) still informs how layouts name
+engine-facing buffers. Decision (2)–(3) described the retired `pw_dot` / layout
+backends. On `mainline-hybrid` the emit path is CIRCT hybrid
+(`tessera.hybrid.circt.v1`): solved Tessera dialect → CIRCT → ExportVerilog with
+a single `*_sched_core` datapath; `tessera.engine` / bind are mapping decisions
+reflected as `engines_busy` one-hot, not per-engine FSMs. See the concept book
+§8 and `docs/cli.md`.
 
 ## Context
 

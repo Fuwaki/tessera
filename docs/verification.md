@@ -1,6 +1,6 @@
 # Verification and acceptance
 
-This document defines how Tessera's full-graph pipeline is accepted, what the
+This document defines how Tessera's CIRCT hybrid pipeline is accepted, what the
 acceptance fixtures are, and how every expected value in them was derived. It is
 the contract the acceptance suite enforces:
 
@@ -9,11 +9,11 @@ the contract the acceptance suite enforces:
 | `fixtures/acceptance/**` | `cargo test -p tessera --test acceptance_vectors` | §6.1 |
 | manifest → graph → lowered plan | `cargo test -p tessera --test acceptance_pipeline` | §6.2 |
 | CLI stages, empty-DSP target, impossible budget, stale provenance | `cargo test -p tessera --test acceptance_pipeline`, `--test acceptance_cli` | §6.2, §6.3 |
-| emitted RTL vs the independent reference | `cargo test -p tessera --test acceptance_cli` (or `scripts/acceptance_full_graph.sh`) | §5, §6.3 |
-| the whole gate, driven like a user | `scripts/acceptance_full_graph.sh` | §6.4 |
+| emitted RTL vs the integer reference | CIRCT bundle TB + Verilator (`*_sched_core`) | §5 |
+| CIRCT emit with `--graph` content | `tessera emit --tessera <solved.mlir> --graph <graph.tgraph>` | §5 |
 
 **Status of this document.** This document *defines* the gate; it records no
-result. The gate — `scripts/acceptance_full_graph.sh --strict` plus
+result. The gate — CIRCT emit + Verilator bit-exact on a solved module plus
 `cargo test` on the three acceptance targets — is executed once, at the final
 integration wave, over the whole tree. No acceptance result, pass or failure, is
 claimed anywhere in this document.
@@ -43,13 +43,13 @@ An acceptance value is only worth as much as its independence. In this suite:
 * **Nothing unavailable is presented as verified.** A gate that cannot run (no
   simulator, a plan outside the emitted envelope, the MLIR planning stage
   unavailable, no real model to import) reports `SKIP`/`UNCOV` with its reason —
-  and in the acceptance configuration it is a **failure**: `scripts/acceptance_full_graph.sh
+  and in the acceptance configuration it is a **failure**: `CIRCT hybrid Verilator check
   --strict` exports `TESSERA_ACCEPTANCE_STRICT=1`, which makes the acceptance
   tests panic instead of skipping, and treats an uncovered gate, a refused
-  full-graph emission, an unavailable `optimize`, or missing simulated
+  CIRCT hybrid emission, an unavailable `optimize`, or missing simulated
   residual/unsigned/bias coverage as a failure. The narrow pointwise envelope is
   a *regression* path only: its absence is reported loudly but does not gate the
-  full-graph acceptance.
+  CIRCT hybrid acceptance.
 
 What is *not* in scope: synthesis results, timing closure, absolute cycle counts
 on hardware, and model accuracy. The suite checks the integer contract the
@@ -250,7 +250,7 @@ exercises real depthwise layers, real residual adds, a nearest upsample and an
 unsigned head.
 
 *Not covered for the real model*: RTL emission. It is a 29-layer graph; the
-acceptance gate for it is the full-graph backend, which the acceptance graph
+acceptance gate for it is the CIRCT hybrid path, which the acceptance graph
 already gates.
 
 ## 4. Stimulus and trace contract
@@ -351,14 +351,14 @@ reference. `--nocapture` prints the skip reasons.
 ### 6.4 The whole gate
 
 ```sh
-scripts/acceptance_full_graph.sh           # development: notes uncovered gates
-scripts/acceptance_full_graph.sh --strict  # THE acceptance run
+CIRCT hybrid Verilator check           # development: notes uncovered gates
+CIRCT emit + Verilator (bit-exact)  # THE acceptance run
 ```
 
 `--strict` is the acceptance configuration and must be used at the final wave. It
 
 * exports `TESSERA_ACCEPTANCE_STRICT=1`, so the acceptance tests fail (panic)
-  rather than skip when a required gate is unavailable — full-graph `emit` being
+  rather than skip when a required gate is unavailable — CIRCT hybrid `emit` being
   refused, no simulation evidence, and missing simulated residual/unsigned/bias
   coverage are failures, not notes;
 * requires the MLIR planning stage (§6.5);
@@ -450,7 +450,7 @@ They are deliberately listed so that the acceptance run can be read against a
 known baseline: **update this section when the listed fixes land**, rather than
 leaving a stale claim in place.
 
-* The full-graph RTL gate (emit -> simulate -> trace comparison) is only
+* The CIRCT hybrid RTL gate (emit -> simulate -> trace comparison) is only
   satisfied once a backend can emit the seven-step plan. Until then the
   acceptance run fails it loudly under `--strict`, so the gap can never be
   mistaken for a pass. The RTL bundle's refusal, not the suite, defines when it

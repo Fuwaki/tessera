@@ -6,8 +6,9 @@ can be inspected, compared, or rerun without repeating earlier work, and a
 failed later stage never invalidates an earlier artifact (ADR-0002).
 
 ```text
-manifest.json --import--> graph.tgraph --emit-mlir--> mlir.json
-              --solve--> layout.tlayout + plan.tplan --emit--> rtl/
+manifest.json --import--> graph.tgraph --emit-mlir--> mlir.json / module.mlir
+              --solve --tessera--> tessera.mlir + solved.mlir (+ layout)
+              --emit --tessera--> rtl/   (CIRCT ExportVerilog, *_sched_core)
 ```
 
 Run `tessera <command> --help` for the authoritative flags; this document
@@ -30,10 +31,11 @@ anything in it:
 | `primitive.json` | `solve` | the lowered planner graph (`PlanInput`) |
 | `primitives.json` | `solve --mlir` | the `tessera.primitive` artifact: plan, code intervals, fusion groups, buffers, MLIR provenance |
 | `target.toml`, `policy.toml` | `solve` | copies of the constraint inputs the layout was solved against |
-| `layout.tlayout` | `solve` | `tessera.layout` artifact (TOML) |
-| `plan.tplan` | `solve`, `emit`, `simulate` | `tessera.execution_plan` projection (TOML) |
-| `rtl/` | `emit`, `simulate` | the RTL bundle (SystemVerilog, testbench, memory images, `rtl_bundle.json`) |
-| `sim/` | `simulate` | Verilator work directory |
+| `tessera.mlir` | `solve --tessera` | Tessera dialect module fed to CP-SAT |
+| `solved.mlir` | `solve --tessera` | Dialect with `tessera.engine` / `bind` / `buffer` / `segment` / `schedule` |
+| `layout.tlayout` | `solve` | `tessera.layout` artifact (TOML) beside the dialect solve |
+| `rtl/` | `emit --tessera` | CIRCT hybrid RTL bundle (SystemVerilog, testbench, `rtl_bundle.json`) |
+| `sim/` | Verilator work dir | Simulation logs when a TB is run |
 
 `--out` is a convenience, not a database: every command also accepts an
 artifact path directly, so a user may keep artifacts wherever they like.
@@ -86,48 +88,22 @@ run the stage and says so — it never pretends the module was optimized.
 ### `solve`
 
 ```sh
-tessera solve --graph build/w8/graph.tgraph \
+tessera solve --tessera build/w8/tessera.mlir \
     --target fixtures/targets/ti60f225.toml \
-    --policy fixtures/policies/explore.toml --out build/w8
-
-tessera solve --primitive fixtures/pointwise/plan_input.json \
-    --target fixtures/targets/ti60f225.toml \
-    --policy fixtures/policies/streaming.toml --out build/pointwise
+    --policy fixtures/policies/emit.toml --out build/w8
 ```
 
-Lowers the input to the planner's typed primitive graph, copies the target and
-policy into the stage directory, runs the layout search, and writes
-`layout.tlayout` plus, when the plan is feasible, `plan.tplan`. Exactly one
-input is selected:
+Reads a Tessera dialect module (or annotated tensor-level linalg, converted in
+process). CP-SAT jointly decides engine count, operator binding, fold, schedule,
+pipeline cuts and arena placement, then writes those decisions back into the
+**same** Melior module as `tessera.engine` / `bind` / `buffer` / `segment` /
+`schedule`. The stage directory receives `tessera.mlir`, `solved.mlir`, copies
+of the target and policy, and a `layout.tlayout` summary.
 
-* `--graph` lowers the manifest graph directly (convolution layers, `add`,
-  nearest upsample and the unsigned output quantization). The manifest's
-  per-channel requantization is serialized to fixed-point `(M0, shift)` and
-  carried verbatim in the layout.
-* `--mlir` lowers the **optimized module** instead: `tessera::primitive::lower`
-  builds the plan from the module's own operations, loop nests and materialized
-  buffers and verifies it against the module's analysis, so this path cannot
-  re-derive a plan behind MLIR's back. It writes `primitive.json` (the planner's
-  contract), `primitives.json` (the `tessera.primitive` artifact, with code
-  intervals, fusion groups, buffers and MLIR provenance) and records the input
-  resolution the module was emitted for.
-* `--primitive` solves a primitive graph (either form) directly, which is how
-  the pointwise fixture reaches the narrow RTL envelope without a manifest.
-* An **infeasible** or **inconclusive** search is written, reported, and the
-  command exits non-zero: no candidate is ever chosen silently.
+`tessera.engine` / bind are mapping decisions for later RTL reflection
+(`engines_busy` one-hot); they are not a promise of per-engine FSMs in the
+emitted DUT.
 
-`solve` also prints the numerical contract it produces: the identifier
-`tessera.fixed_point.requant.half_away_from_zero.v1`, the half-away-from-zero rounding and multiplier width, and
-the worst recorded step error of the serialized `M0`/`shift` against the
-manifest's `f32` coefficients. The exactness baseline is the **compiled
-fixed-point IR** — the training `f32` requantization factors are approximated,
-with that bound recorded per step rather than described as bit-exact.
-
-The search report distinguishes a proven result from a truncated one: `solve`
-prints the layout's `certainty` (`optimal`, `best_effort`, `proven_infeasible`,
-`inconclusive`) with the candidate/expansion counts, and reports per-execution-mode
-candidates, feasible candidates and the first rejection reason. A search that hit
-its candidate budget is reported as INCONCLUSIVE, never as "no feasible layout".
 
 ### `inspect`
 
@@ -147,57 +123,46 @@ at.
 ### `emit`
 
 ```sh
-tessera emit build/pointwise/layout.tlayout \
-    --weights fixtures/pointwise/weights --out build/pointwise
-
-tessera emit build/w8/layout.tlayout \
+tessera emit --tessera build/w8/solved.mlir \
     --graph build/w8/graph.tgraph --out build/w8
 ```
 
-Projects the validated layout onto an execution plan and emits the RTL bundle.
-`--weights <DIR>` resolves `<tensor-name>.bin` blobs for primitive fixtures;
-`--graph <graph.tgraph>` resolves weight bytes from the manifest blob through
-the layer ranges the frontend recorded, re-checked against the artifact's
-SHA-256.
+CIRCT hybrid path only (`tessera.hybrid.circt.v1`):
 
-Emission fails closed, and dispatches on the plan's shape:
+1. Parse the solved Tessera dialect in Melior.
+2. Lower mapping + ops into CIRCT `hw` / `comb` / `sv` in the same context.
+3. Run in-process ExportVerilog into `rtl/`.
 
-* **One pointwise step** goes to the single-kernel backend: signed int8
-  activations, ROM-resident weights, streamed activation buffers, one
-  requantization contract, no bias.
-* **Any other plan** goes to the full-graph backend, which emits one
-  static-schedule FSM over an activation arena with a single shared MAC array.
-  It requires a `shared_tile` frame schedule whose steps ask for `tap_parallel
-  == 1` and at most 64 MAC lanes, and it refuses a streaming- or
-  dedicated-labelled plan by name rather than relabelling it. Because it resolves
-  bias from the model, it needs `--graph`, not `--weights`.
+The DUT datapath is a single integer `*_sched_core` (ROMs, i16×i8 MAC, requant,
+add/upsample). Solved engines/binds appear as `engines_busy` (one-hot of the
+engine that owns the core's current op) — not as separate per-engine modules.
 
-Anything outside both envelopes is reported by step name, for example:
+`--graph <graph.tgraph>` resolves weight and requant bytes from the manifest
+blob so ROMs and the self-checking testbench are content-filled. Without
+`--graph`, structure can still emit but content-filled / bit-exact emission
+requires resolved ops from the graph.
 
-```text
-error: rtl: unsupported layout: v1 emits exactly one kernel, but the plan has 7
-steps [stem(Conv2d), dw(DepthwiseConv2d), ...]; the supported envelope is a
-single pointwise step
-```
+Layout-only `emit <layout.tlayout>` is retired on this branch and fails with a
+pointer to `--tessera`.
 
-For the full-graph path `emit` prints the generated structure next to the
-planner's estimate — arena words x word width, the arena's RAM10 equivalent, MAC
-lanes, MACs per frame, and both the unstalled generated cycle count and the
-plan's cycle estimate — so a resource estimate is never mistaken for a
-measurement, and a `semantic_notes` entry is shown rather than hidden.
 
 ### `simulate`
 
 ```sh
-tessera simulate build/pointwise/layout.tlayout \
-    --weights fixtures/pointwise/weights --out build/pointwise
+# Prefer running the emitted self-checking TB after a CIRCT emit, e.g.:
+#   sh build/w8/rtl/run_verilator.sh
+# or Verilator against rtl/<module>_tb.sv with the hex stimuli beside it.
 ```
 
-Emits the bundle (deterministically, byte-for-byte identical to `emit`) and runs
-the generated self-checking testbench with Verilator against the Rust reference
-model. When Verilator is not installed the command prints `simulation: SKIP` and
-exits 0 — it never reports a pass it did not observe. Set `TESSERA_VERILATOR` to
-point at a specific binary.
+The CIRCT bundle's testbench compares DUT outputs to vectors from the integer
+evaluator (`(acc*M0 + round) >>> shift`). When Verilator is not installed the
+helper prints a skip rather than a false pass. Set `TESSERA_VERILATOR` to point
+at a specific binary.
+
+The legacy `tessera simulate <layout.tlayout>` entry still exists in the CLI
+but routes through the retired layout backends and will fail closed with the
+same CIRCT-path guidance as layout-only `emit`.
+
 
 ### `verify`
 
@@ -223,123 +188,48 @@ artifact must be present.
 
 ## Current scope
 
-Supported today, end to end:
+Supported today, end to end on the CIRCT hybrid path:
 
 * `fpga_st_train.int8.v1` manifest import (i8-x1 and i4-x2 packing), including
   the reference operator set: 3x3 convolution, depthwise 3x3, pointwise 1x1,
   fused relu, residual `add`, nearest 2x upsample, unsigned output quantization.
 * Deterministic MLIR emission for that subset; in-process optimization behind the
-  `melior` feature; and lowering the *optimized module* (not the graph) into the
-  planner's primitive graph, verified against the module's own analysis.
-* Ti60-family target model and layout search with per-mode rejection reports, an
-  explicit certainty classification, and exact activation code intervals that
-  size the datapath (a residual sum is carried at nine bits, not clamped to
-  int8).
-* RTL emission and simulation for a **single pointwise step** (streaming
-  interface, ROM weights) and for **whole models** through the full-graph
-  backend: one static-schedule FSM over an activation arena with a single shared
-  MAC array, `shared_tile`/frame plans, bias and weights resolved from the
-  manifest.
+  `melior` feature.
+* Tessera dialect + in-process CP-SAT mapping solve writing engine / bind /
+  buffer / segment / schedule decisions into `solved.mlir`.
+* RTL emission via CIRCT ExportVerilog with a single `*_sched_core` datapath;
+  `engines_busy` one-hot reflects bind decisions; Verilator bit-exact check
+  against the integer contract when `--graph` fills content.
 
 Not supported yet (each fails with a named error rather than a wrong result):
 
-* Hybrid architectures, DMA scheduling, ping-pong frame overlap, and plans whose
-  steps want more than `tap_parallel == 1` or 64 MAC lanes on the full-graph
-  engine.
+* Per-engine microarchitecture FSMs (engine/bind remain mapping + busy one-hot).
+* DMA scheduling, ping-pong frame overlap.
 * Asymmetric quantization, activation bit widths other than 8, and weight
   widths outside {4, 8}.
 * Synthesis and board measurement.
 
+
 ## Examples
 
 Everything below runs from the repository root with checked-in fixtures and no
-external model files:
+external model files. CIRCT must be available for `emit --tessera`
+(see [developer-setup.md](developer-setup.md)):
 
 ```sh
-# The supported narrow path: solve, emit, verify, simulate.
-tessera solve --primitive fixtures/pointwise/plan_input.json \
-    --target fixtures/targets/ti60f225.toml \
-    --policy fixtures/policies/streaming.toml --out build/pointwise
-tessera emit build/pointwise/layout.tlayout \
-    --weights fixtures/pointwise/weights --out build/pointwise
-tessera verify build/pointwise
-tessera simulate build/pointwise/layout.tlayout \
-    --weights fixtures/pointwise/weights --out build/pointwise
-
-# The whole-model path: import, emit MLIR, solve, emit RTL and simulate.
+# Import and emit tensor MLIR.
 tessera import fixtures/w8 --input-shape 1,6,6,3 --out build/w8
 tessera emit-mlir build/w8/graph.tgraph --out build/w8
-tessera solve --graph build/w8/graph.tgraph \
+
+# Solve on a tessera dialect module (annotated linalg is converted in process).
+tessera solve --tessera build/w8/tessera.mlir \
     --target fixtures/targets/ti60f225.toml \
     --policy fixtures/policies/emit.toml --out build/w8
-tessera inspect build/w8/layout.tlayout
-tessera emit build/w8/layout.tlayout --graph build/w8/graph.tgraph --out build/w8
-tessera simulate build/w8/layout.tlayout --graph build/w8/graph.tgraph --out build/w8
 
-# The same chain through the optimized MLIR module instead of the graph.
-tessera optimize build/w8/mlir.json --out build/w8            # needs the `melior` feature
-tessera solve --mlir build/w8/optimized.json \
-    --target fixtures/targets/ti60f225.toml \
-    --policy fixtures/policies/emit.toml --out build/w8-mlir
-tessera inspect build/w8-mlir/primitives.json
+# CIRCT hybrid emit with content-filled ROMs + bit-exact TB.
+tessera emit --tessera build/w8/solved.mlir \
+    --graph build/w8/graph.tgraph --out build/w8
+
+tessera verify build/w8
+tessera inspect build/w8/rtl/rtl_bundle.json
 ```
-
-`build/` and `out/` are ignored by git; `fixtures/` is committed and
-regenerated deterministically by
-
-```sh
-cargo run -p tessera --example generate_fixtures
-```
-
-### Committed review snapshots
-
-`fixtures/snapshots/{w8,ink_dw}/` are complete stage directories produced by the
-commands above (graph, weights, emitted and optimized MLIR, primitive graph,
-target and policy copies, layout, plan, the `rtl/` bundle and the per-step trace).
-They are committed so the emitted structure can be inspected and re-verified
-without an FPGA toolchain:
-
-```sh
-tessera verify fixtures/snapshots/w8
-tessera inspect fixtures/snapshots/ink_dw/rtl/rtl_bundle.json
-```
-
-The generator does not touch them: it writes only the fixtures listed above. See
-[artifacts.md](artifacts.md) for what each snapshot contains and the measured
-numbers behind it.
-
-### Real-model fixture
-
-`fixtures/ink_dw/` is a **snapshot of a real trained model**, not generated: the
-`tiny_dw` W8A8 manifest and weight blob from
-`st_work/fst/runs/ink_dw/quant/w8a8` (manifest sha256
-`e2daffcbb02c5729a6195b35b10bdb9b3fadbe3fd6109626c2d22992ff11dc6e`, weights
-sha256 `caf1d7da0064e587d158f7e39fd7eb77f15a028cac0d0c489fd3e5ac77a5190b`). It
-covers conv 3×3, depthwise 3×3 with stride 2, reflect padding, four residual
-`add`s, two nearest upsamples and an unsigned head: 29 layers, 61 graph ops,
-50 144 weight bytes, `i8-x1`.
-
-The manifest carries no spatial extents, so the input resolution is chosen by the
-caller. The reference flow in `nngen/examples/st_stream` runs this model at
-`--res 640x480`, which its planner parses as `width x height`; in Tessera's
-`N,H,W,C` order that is `--input-shape 1,480,640,3`. The exporter's reference size,
-40×20, is `--input-shape 1,20,40,3`, which is what the acceptance tests
-use for fast runs.
-
-```sh
-tessera import fixtures/ink_dw --input-shape 1,20,40,3 --out build/ink
-tessera solve --graph build/ink/graph.tgraph \
-    --target fixtures/targets/ti60f225.toml \
-    --policy fixtures/policies/explore.toml --out build/ink
-```
-
-The whole model is planned with `fixtures/policies/emit.toml`, the policy shaped
-to the emitted full-graph engine (shared-tile frame schedule, `tap_parallel == 1`,
-at most 64 MAC lanes per convolution step). The resolution you pick is a budget
-decision, not a modelling one: the activation arena is frame-sized, while the
-50 144 weight bytes are resolution-independent, so the same 29-layer model can fit
-at a smaller input and not at the reference 40x20. `solve` reports its result
-with a certainty and per-mode rejections, and `emit` reports the arena's RAM10
-equivalent next to the planner's estimate, so an infeasible resolution is an
-explicit, readable outcome rather than a hidden rounding. See ADR-0003 and
-[verification.md](verification.md).
