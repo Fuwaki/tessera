@@ -2,12 +2,52 @@
 
 ## Default build
 
-The default build has no non-Rust dependencies:
+The default build links the native CP-SAT backend, so it needs two non-Rust
+pieces:
+
+* **OR-Tools C++ 9.15** — the pinned `cpsat-rs` binding compiles the CP-SAT
+  protos vendored from OR-Tools 9.15 and calls the CP-SAT C API
+  (`SolveCpModelWithParameters`) in `libortools.so`,
+* **`protoc`** on `PATH` (or `PROTOC=<path>`), for those vendored protos.
+
+The build script searches the usual prefixes and then `/opt/ortools`; point
+`ORTOOLS_PREFIX` at the installation when it lives elsewhere:
 
 ```sh
+export ORTOOLS_PREFIX=/opt/ortools          # an or-tools_*_cpp_v9.15.6755 prefix
+export LD_LIBRARY_PATH="$ORTOOLS_PREFIX/lib:$LD_LIBRARY_PATH"
+
 cargo build
 cargo test
+cargo run -p tessera -- solve --primitive fixtures/pointwise/plan_input.json \
+    --target fixtures/targets/ti60f225.toml \
+    --policy fixtures/policies/streaming.toml --out build/pointwise
 ```
+
+`ORTOOLS_PREFIX` is read at *build* time, but `libortools.so` is linked
+dynamically, so that prefix's `lib` must also be on the loader path whenever a
+binary that links the backend runs. Today that is the mapping-solver
+integration tests (`cargo test --test mapping_solver`, `--test mapping_rtl`)
+and anything else that calls `tessera::solver`; a binary that never references
+the backend does not carry the dependency at all, which is why a plain
+`tessera solve` works with no loader path. Without `LD_LIBRARY_PATH` (or an
+equivalent rpath) a binary that does link the backend fails to start with:
+
+```text
+error while loading shared libraries: libortools.so.9: cannot open shared object file
+```
+
+`protoc` is only needed at build time; any protobuf compiler recent enough for
+`prost-build` 0.13 works, and the OR-Tools archive ships one at
+`$ORTOOLS_PREFIX/bin/protoc` for hosts without a system `protoc`:
+
+```sh
+PROTOC="$ORTOOLS_PREFIX/bin/protoc" cargo build
+```
+
+Nothing about this is committed to the repository: the prefix is read from the
+environment, so a checkout stays portable and a missing or mismatched OR-Tools
+fails the build loudly inside `cpsat-rs` instead of silently dropping the solver.
 
 Everything except the `optimize` stage works without MLIR: manifest import,
 MLIR *emission*, graph lowering, layout search, RTL emission and Verilator
@@ -35,8 +75,8 @@ build scripts are driven by environment variables whose names are versioned:
 prefix, and that prefix's `bin/llvm-config` must report `23.x`:
 
 ```sh
-export MLIR_SYS_230_PREFIX=/home/fuwaki/.local/share/mlir23   # llvm-config 23.1.3
-export TABLEGEN_230_PREFIX=/home/fuwaki/.local/share/mlir23
+export MLIR_SYS_230_PREFIX="$HOME/.local/share/mlir23"   # llvm-config 23.1.3
+export TABLEGEN_230_PREFIX="$HOME/.local/share/mlir23"
 "$MLIR_SYS_230_PREFIX/bin/llvm-config" --version                # -> 23.1.3
 
 cargo check -p tessera --features melior
@@ -44,12 +84,11 @@ cargo test  -p tessera --features melior
 cargo run   -p tessera --features melior -- optimize build/w8/mlir.json --out build/w8
 ```
 
-On this workstation that prefix is the LLVM/MLIR 23.1.3 install at
-`/home/fuwaki/.local/share/mlir23` (it carries `lib/cmake/mlir` and
-`bin/llvm-tblgen`). No `LD_LIBRARY_PATH` is needed: `mlir-sys` links the static
-MLIR archives by default. If a shared link is requested
-(`MLIR_SYS_LINK_SHARED=1`), add `$MLIR_SYS_230_PREFIX/lib` to `LD_LIBRARY_PATH`
-when *running* the compiler.
+The prefix in the example is an LLVM/MLIR 23.1.3 install (it carries
+`lib/cmake/mlir` and `bin/llvm-tblgen`). No `LD_LIBRARY_PATH` is needed:
+`mlir-sys` links the static MLIR archives by default. If a shared link is
+requested (`MLIR_SYS_LINK_SHARED=1`), add `$MLIR_SYS_230_PREFIX/lib` to
+`LD_LIBRARY_PATH` when *running* the compiler.
 
 `MLIR_SYS_230_PREFIX` must point at a prefix whose `bin/llvm-config` reports
 version 23.x. Pointing it at anything else fails loudly, for example:

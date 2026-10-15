@@ -1080,11 +1080,32 @@ fn emit_bundle(
         .map_err(|error| anyhow!("projecting the execution plan: {error}"))?;
     write_plan(&dir.path(stages::PLAN_FILE), &plan)?;
 
-    // Dispatch by plan shape, never by preference: a single pointwise step goes
-    // to the single-kernel backend unchanged; anything else needs the full-graph
-    // backend *and* the graph artifact, because bias comes from the model and
-    // cannot be recovered from weight bytes alone.
-    let bundle = if plan.steps.len() > 1 {
+    // Dispatch by plan shape, never by preference: a schema-2 plan carries the
+    // solved mapped organization and goes to the mapped backend; a single
+    // pointwise step goes to the single-kernel backend unchanged; anything else
+    // needs the full-graph backend *and* the graph artifact, because bias comes
+    // from the model and cannot be recovered from weight bytes alone.
+    let bundle = if plan.mapping.is_some() {
+        match graph {
+            Some(graph_path) => {
+                let artifact = load_graph_file(graph_path)?;
+                let resolver = graph_resolver(&artifact, graph_path)?;
+                println!(
+                    "  mapped backend: {} steps over {} engine instance(s), {} pipeline link(s)",
+                    plan.steps.len(),
+                    plan.mapping.as_ref().map_or(0, |m| m.engines.len()),
+                    plan.mapping.as_ref().map_or(0, |m| m.pipeline.len())
+                );
+                rtl::lower_mapped(&plan, artifact.graph(), &resolver, config)
+                    .map_err(|error| anyhow!("{error}"))?
+            }
+            None => bail!(
+                "the plan carries a hardware mapping (schema 2), which the mapped backend emits \
+                 against the graph artifact: pass --graph <graph.tgraph> instead of --weights \
+                 <DIR>"
+            ),
+        }
+    } else if plan.steps.len() > 1 {
         match graph {
             Some(graph_path) => {
                 let artifact = load_graph_file(graph_path)?;

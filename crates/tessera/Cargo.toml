@@ -8,6 +8,12 @@ description = "An extensible hardware-aware compiler for quantized neural networ
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# In-process CP-SAT backend for `src/solver/`. Pinned exactly: the FFI C API and
+# the protos vendored by the crate are OR-Tools release specific, so a range
+# would silently mix an API with a different model schema. Requires an OR-Tools
+# C++ 9.15 installation plus `protoc` at build time (see
+# docs/developer-setup.md); the default build therefore needs both.
+cpsat-rs = "=0.1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Optional in-process MLIR. Pinned exactly: both the pass names and the Melior

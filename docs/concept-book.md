@@ -279,7 +279,11 @@ Objectives are configurable. Examples:
 - minimize BRAM;
 - produce a Pareto frontier.
 
-The first solver should use candidate enumeration, pruning, and branch-and-bound. A CP-SAT solver may be introduced after the cost model and plan schema stabilize.
+The planner's own search is candidate enumeration, pruning, and branch-and-bound.
+The joint mapping solve (`src/solver/`) is a real constraint program: it encodes
+engines, bindings, folds, schedule, pipeline cuts and arena placement into a
+solver-agnostic model and hands it to CP-SAT in process, which is the "after the
+cost model and plan schema stabilize" step described here.
 
 ## 8. RTL backends
 

@@ -46,6 +46,7 @@ pub mod mlir;
 pub mod planner;
 pub mod primitive;
 pub mod rtl;
+pub mod solver;
 pub mod stages;
 pub mod target;
 pub mod weights;

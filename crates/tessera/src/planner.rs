@@ -3097,6 +3097,7 @@ pub fn solve(
             fusions: Vec::new(),
             rejections,
             search: search_stats,
+            mapping: None,
         };
         artifact.normalize();
         return Ok(artifact);
@@ -3356,6 +3357,7 @@ pub fn solve(
         fusions,
         rejections,
         search: search_stats,
+        mapping: None,
     };
     artifact.normalize();
     Ok(artifact)

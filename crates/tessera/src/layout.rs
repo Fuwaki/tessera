@@ -24,7 +24,7 @@
 //! is deterministic: collections are normalized (sorted) before serialization,
 //! so two equal artifacts always render byte-identically.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,14 @@ use crate::target::toml_lite::{self, TomlError};
 pub const LAYOUT_FORMAT: &str = "tessera.layout";
 /// Layout artifact schema version implemented by this build.
 pub const LAYOUT_SCHEMA_VERSION: u32 = 1;
+/// Layout artifact schema version that carries a [`HardwareMapping`].
+///
+/// Version 2 is the general multi-engine organization: several engine
+/// instances, an explicit op-to-engine binding, an optional pipeline cut and
+/// the buffer residences that back every tensor. Version 1 stays valid and
+/// byte-identical: it has no mapping and its single shared engine is only
+/// summarized by the selection.
+pub const LAYOUT_SCHEMA_VERSION_V2: u32 = 2;
 /// Execution-plan format tag.
 pub const PLAN_FORMAT: &str = "tessera.execution_plan";
 /// Execution-plan schema version implemented by this build.
@@ -1616,6 +1624,187 @@ pub struct RejectionSummary {
     pub by_mode: BTreeMap<String, ModeSummary>,
 }
 
+// ---------------------------------------------------------------------------
+// Hardware mapping (schema 2)
+// ---------------------------------------------------------------------------
+
+/// How an engine instance is shared.
+///
+/// A [`EngineRole::Dedicated`] engine has exactly one operator bound to it; a
+/// [`EngineRole::Shared`] engine time-multiplexes at least two. The role is a
+/// consequence of the binding count, not a mode the search picks up front: the
+/// same physical array is dedicated or shared depending on how many operators
+/// the schedule gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineRole {
+    /// Time-multiplexes two or more operators.
+    Shared,
+    /// Serves exactly one operator.
+    Dedicated,
+}
+
+impl EngineRole {
+    /// Stable tag.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EngineRole::Shared => "shared",
+            EngineRole::Dedicated => "dedicated",
+        }
+    }
+}
+
+/// One instantiated MAC engine.
+///
+/// `simd × pe × tap_parallel` is the number of multiply-accumulate lanes the
+/// backend instantiates for this instance ([`EngineInstance::lanes`]). The
+/// datapath widths describe the registers and memories around it, exactly as
+/// [`EngineConfig`] does for the v1 single engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineInstance {
+    /// Stable instance name, referenced by bindings and pipeline links.
+    pub name: String,
+    /// Whether the instance is shared or dedicated.
+    pub role: EngineRole,
+    /// Input-channel SIMD lanes.
+    pub simd: u32,
+    /// Output-channel PE lanes.
+    pub pe: u32,
+    /// Kernel tap parallelism.
+    pub tap_parallel: u32,
+    /// Activation word width in bits.
+    pub activation_bits: u32,
+    /// Accumulator width in bits.
+    pub accumulator_bits: u32,
+    /// Weight word width in bits.
+    pub weight_bits: u32,
+}
+
+impl EngineInstance {
+    /// Multiply-accumulate lanes this instance physically instantiates.
+    pub const fn lanes(&self) -> u64 {
+        self.simd as u64 * self.pe as u64 * self.tap_parallel as u64
+    }
+
+    /// Whether the declared datapath widths are non-zero.
+    pub const fn widths_are_sound(&self) -> bool {
+        self.activation_bits > 0 && self.accumulator_bits > 0 && self.weight_bits > 0
+    }
+}
+
+/// Binding of one scheduled operator to one engine instance.
+///
+/// `candidate` names the [`SpatialShape`](crate::solver::SpatialShape) fold the
+/// binding chose, kept for auditability. `temporal_iterations` is the number of
+/// lane-array sweeps the operator costs on this engine
+/// (`macs / lanes`, rounded up) and `macs` is the true product count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpEngineBinding {
+    /// Operator name (matches a schedule step).
+    pub op: String,
+    /// Engine instance the operator runs on.
+    pub engine: String,
+    /// Name of the chosen spatial shape.
+    pub candidate: String,
+    /// Input-channel SIMD lanes of the binding.
+    pub simd: u32,
+    /// Output-channel PE lanes of the binding.
+    pub pe: u32,
+    /// Kernel tap parallelism of the binding.
+    pub tap_parallel: u32,
+    /// Lane-array sweeps the operator costs on this engine.
+    pub temporal_iterations: u64,
+    /// Multiply-accumulate products the operator performs.
+    pub macs: u64,
+}
+
+impl OpEngineBinding {
+    /// Lanes this binding uses (`simd × pe × tap`).
+    pub const fn lanes(&self) -> u64 {
+        self.simd as u64 * self.pe as u64 * self.tap_parallel as u64
+    }
+}
+
+/// A chosen producer/consumer cut that lets two engines overlap.
+///
+/// The producer engine writes `tensor` into a FIFO of `depth_elements` words so
+/// the consumer can start before the producer finishes. A `PipelineLink` is the
+/// *only* licence to overlap: without one, the consumer waits for the producer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineLink {
+    /// Engine producing the tensor.
+    pub producer_engine: String,
+    /// Engine consuming the tensor.
+    pub consumer_engine: String,
+    /// Tensor crossing the cut.
+    pub tensor: TensorId,
+    /// FIFO depth in elements.
+    pub depth_elements: u32,
+}
+
+/// Where a tensor's words live in the mapped organization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BufferKind {
+    /// Placed in the shared on-chip arena, by lifetime.
+    Arena,
+    /// A pipeline FIFO between two engine instances.
+    Fifo,
+    /// A register-resident word (no addressable storage).
+    Register,
+}
+
+/// Residence of one tensor in the mapped organization.
+///
+/// `words` is the tensor's element count; `offset_words` is its word offset in
+/// the arena, meaningful only for [`BufferKind::Arena`]. `producer_op` and
+/// `consumer_ops` name the schedule steps that write and read it, so the
+/// validator can recompute liveness instead of trusting the placement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BufferResidence {
+    /// Tensor held.
+    pub tensor: TensorId,
+    /// Residence kind.
+    pub kind: BufferKind,
+    /// Words (elements) held.
+    pub words: u64,
+    /// Word offset inside the arena (Arena residences only).
+    pub offset_words: u64,
+    /// Operator that produces the tensor.
+    ///
+    /// [`crate::solver::check::GRAPH_INPUT_SENTINEL`] when no operator produces
+    /// it (a graph input); the field is never empty, because the TOML subset the
+    /// artifact round-trips through cannot carry an empty string.
+    pub producer_op: String,
+    /// Operators that consume the tensor, in schedule order.
+    pub consumer_ops: Vec<String>,
+}
+
+/// The solved hardware organization: engines, bindings, pipeline and buffers.
+///
+/// This is the schema-2 payload. It is produced only after the independent
+/// checker in [`crate::solver::check`] has recomputed every field from the
+/// constraint assignment, so a feasible artifact is never a bare restatement of
+/// the solver's own status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareMapping {
+    /// Instantiated engines, in deterministic name order.
+    pub engines: Vec<EngineInstance>,
+    /// Operator-to-engine bindings, in deterministic (op, engine) order.
+    pub bindings: Vec<OpEngineBinding>,
+    /// Pipeline cuts, in deterministic order.
+    pub pipeline: Vec<PipelineLink>,
+    /// Tensor residences, in deterministic order.
+    pub buffers: Vec<BufferResidence>,
+    /// Critical-path frame length in cycles.
+    pub makespan_cycles: u64,
+}
+
 /// Search statistics for reproducibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1642,7 +1831,7 @@ pub struct SearchStats {
 pub struct LayoutArtifact {
     /// Must equal [`LAYOUT_FORMAT`].
     pub format: String,
-    /// Must equal [`LAYOUT_SCHEMA_VERSION`].
+    /// Must equal [`LAYOUT_SCHEMA_VERSION`] or [`LAYOUT_SCHEMA_VERSION_V2`].
     pub schema_version: u32,
     /// Feasibility status.
     pub status: PlanStatus,
@@ -1683,6 +1872,9 @@ pub struct LayoutArtifact {
     pub rejections: RejectionSummary,
     /// Search statistics.
     pub search: SearchStats,
+    /// Solved hardware mapping, present only for schema 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapping: Option<HardwareMapping>,
 }
 
 /// Errors produced while loading, validating or projecting a layout artifact.
@@ -1807,6 +1999,25 @@ impl LayoutArtifact {
                 step.fused_with.sort();
             }
         }
+        if let Some(mapping) = &mut self.mapping {
+            mapping.engines.sort_by(|a, b| a.name.cmp(&b.name));
+            mapping
+                .bindings
+                .sort_by(|a, b| (&a.op, &a.engine).cmp(&(&b.op, &b.engine)));
+            mapping.pipeline.sort_by(|a, b| {
+                (&a.producer_engine, &a.consumer_engine, a.tensor).cmp(&(
+                    &b.producer_engine,
+                    &b.consumer_engine,
+                    b.tensor,
+                ))
+            });
+            mapping.buffers.sort_by(|a, b| {
+                (a.tensor, a.kind, a.offset_words).cmp(&(b.tensor, b.kind, b.offset_words))
+            });
+            for residence in &mut mapping.buffers {
+                residence.consumer_ops.sort();
+            }
+        }
         self.rejections.samples.sort();
     }
 
@@ -1826,6 +2037,283 @@ impl LayoutArtifact {
         )
     }
 
+    /// Validate the schema-2 hardware mapping against the schedule.
+    ///
+    /// The mapping is the plan's real structure, so nothing here is trusted
+    /// from the solver: bindings, roles, pipeline endpoints, arena liveness and
+    /// the makespan formula are all recomputed from the schedule.
+    fn validate_mapping(&self, mapped: bool) -> Result<(), LayoutError> {
+        if !mapped {
+            return Ok(());
+        }
+        let mapping = match &self.mapping {
+            Some(mapping) => mapping,
+            None => return Ok(()),
+        };
+        let invalid = |detail: String| LayoutError::Invalid { detail };
+
+        let engine_of = |name: &str| mapping.engines.iter().find(|e| e.name == name);
+        for instance in &mapping.engines {
+            if !instance.widths_are_sound() {
+                return Err(invalid(format!(
+                    "engine {:?} declares a zero-width datapath",
+                    instance.name
+                )));
+            }
+            if instance.lanes() == 0 {
+                return Err(invalid(format!(
+                    "engine {:?} instantiates zero lanes",
+                    instance.name
+                )));
+            }
+        }
+        let mut engine_names: BTreeSet<&str> = BTreeSet::new();
+        for instance in &mapping.engines {
+            if !engine_names.insert(instance.name.as_str()) {
+                return Err(invalid(format!(
+                    "engine name {:?} is not unique",
+                    instance.name
+                )));
+            }
+        }
+
+        // (1) one binding per schedule step, keyed by operator name.
+        if mapping.bindings.len() != self.schedule.len() {
+            return Err(invalid(format!(
+                "mapping carries {} bindings for {} schedule steps",
+                mapping.bindings.len(),
+                self.schedule.len()
+            )));
+        }
+        let mut bound: BTreeSet<&str> = BTreeSet::new();
+        for binding in &mapping.bindings {
+            if !bound.insert(binding.op.as_str()) {
+                return Err(invalid(format!(
+                    "operator {:?} has more than one engine binding",
+                    binding.op
+                )));
+            }
+            let step = self
+                .schedule
+                .iter()
+                .find(|step| step.op == binding.op)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "binding references operator {:?} absent from the schedule",
+                        binding.op
+                    ))
+                })?;
+            // (2) the engine exists and the step agrees with the binding.
+            let engine = engine_of(&binding.engine).ok_or_else(|| {
+                invalid(format!(
+                    "binding for {:?} references unknown engine {:?}",
+                    binding.op, binding.engine
+                ))
+            })?;
+            if step.engine != binding.engine {
+                return Err(invalid(format!(
+                    "step {:?} runs on engine {:?} but its binding names {:?}",
+                    step.op, step.engine, binding.engine
+                )));
+            }
+            // (3) the binding fold, the step cost and the product all agree.
+            if binding.lanes() != step.cost.lanes {
+                return Err(invalid(format!(
+                    "binding for {:?} claims {} lanes but the step costs {}",
+                    binding.op,
+                    binding.lanes(),
+                    step.cost.lanes
+                )));
+            }
+            // (4) the binding fits inside its engine.
+            if binding.lanes() > engine.lanes() {
+                return Err(invalid(format!(
+                    "binding for {:?} uses {} lanes but engine {:?} only instantiates {}",
+                    binding.op,
+                    binding.lanes(),
+                    engine.name,
+                    engine.lanes()
+                )));
+            }
+            if binding.temporal_iterations != step.cost.lane_iterations {
+                return Err(invalid(format!(
+                    "binding for {:?} records {} lane iterations but the step records {}",
+                    binding.op, binding.temporal_iterations, step.cost.lane_iterations
+                )));
+            }
+            if binding.macs != step.cost.macs {
+                return Err(invalid(format!(
+                    "binding for {:?} records {} MACs but the step records {}",
+                    binding.op, binding.macs, step.cost.macs
+                )));
+            }
+        }
+        for step in &self.schedule {
+            if !bound.contains(step.op.as_str()) {
+                return Err(invalid(format!(
+                    "schedule step {:?} has no engine binding",
+                    step.op
+                )));
+            }
+        }
+
+        // (5) the role follows from the binding count.
+        for instance in &mapping.engines {
+            let count = mapping
+                .bindings
+                .iter()
+                .filter(|binding| binding.engine == instance.name)
+                .count();
+            match instance.role {
+                EngineRole::Dedicated if count != 1 => {
+                    return Err(invalid(format!(
+                        "dedicated engine {:?} carries {count} bindings, expected exactly one",
+                        instance.name
+                    )));
+                }
+                EngineRole::Shared if count < 2 => {
+                    return Err(invalid(format!(
+                        "shared engine {:?} carries {count} bindings, expected at least two",
+                        instance.name
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        // (6) pipeline links cross a real tensor between two used engines.
+        for link in &mapping.pipeline {
+            if link.depth_elements < 1 {
+                return Err(invalid(format!(
+                    "pipeline link {} -> {} has a zero-depth FIFO",
+                    link.producer_engine, link.consumer_engine
+                )));
+            }
+            for endpoint in [&link.producer_engine, &link.consumer_engine] {
+                if engine_of(endpoint).is_none() {
+                    return Err(invalid(format!(
+                        "pipeline link references unknown engine {endpoint:?}"
+                    )));
+                }
+                if !mapping
+                    .bindings
+                    .iter()
+                    .any(|binding| &binding.engine == endpoint)
+                {
+                    return Err(invalid(format!(
+                        "pipeline endpoint {endpoint:?} carries no operator binding"
+                    )));
+                }
+            }
+            let producer = self
+                .schedule
+                .iter()
+                .find(|step| step.outputs.contains(&link.tensor))
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "pipeline tensor {} is not produced by any step",
+                        link.tensor
+                    ))
+                })?;
+            if producer.engine != link.producer_engine {
+                return Err(invalid(format!(
+                    "pipeline tensor {} is produced on engine {:?}, not the link's producer {:?}",
+                    link.tensor, producer.engine, link.producer_engine
+                )));
+            }
+            let consumer = self
+                .schedule
+                .iter()
+                .find(|step| step.inputs.contains(&link.tensor))
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "pipeline tensor {} is not consumed by any step",
+                        link.tensor
+                    ))
+                })?;
+            if consumer.engine != link.consumer_engine {
+                return Err(invalid(format!(
+                    "pipeline tensor {} is consumed on engine {:?}, not the link's consumer {:?}",
+                    link.tensor, consumer.engine, link.consumer_engine
+                )));
+            }
+        }
+
+        // (7) arena residences only, and never two live ones on one word.
+        let step_index =
+            |op: &str| -> Option<u32> { self.schedule.iter().find(|s| s.op == op).map(|s| s.step) };
+        let final_step = self.schedule.iter().map(|s| s.step).max().unwrap_or(0);
+        for residence in &mapping.buffers {
+            if residence.kind != BufferKind::Arena && residence.offset_words != 0 {
+                return Err(invalid(format!(
+                    "{:?} residence for tensor {} carries arena offset {}",
+                    residence.kind, residence.tensor, residence.offset_words
+                )));
+            }
+        }
+        let arenas: Vec<(&BufferResidence, u32, u32)> = mapping
+            .buffers
+            .iter()
+            .filter(|residence| residence.kind == BufferKind::Arena)
+            .map(|residence| {
+                let from = step_index(&residence.producer_op).unwrap_or(0);
+                let to = residence
+                    .consumer_ops
+                    .iter()
+                    .filter_map(|op| step_index(op))
+                    .max()
+                    .unwrap_or(final_step);
+                (residence, from, to)
+            })
+            .collect();
+        for i in 0..arenas.len() {
+            for j in (i + 1)..arenas.len() {
+                let (a, a_from, a_to) = arenas[i];
+                let (b, b_from, b_to) = arenas[j];
+                let (a_lo, a_hi) = (a.offset_words, a.offset_words + a.words);
+                let (b_lo, b_hi) = (b.offset_words, b.offset_words + b.words);
+                if a_lo < b_hi && b_lo < a_hi && a_from <= b_to && b_from <= a_to {
+                    return Err(invalid(format!(
+                        "arena tensors {} [{a_lo}..{a_hi}] and {} [{b_lo}..{b_hi}] share words while \
+                         both are live (steps {a_from}..{a_to} and {b_from}..{b_to})",
+                        a.tensor, b.tensor
+                    )));
+                }
+            }
+        }
+
+        // (8)/(9) the makespan formula.
+        let sequential: u64 = self
+            .schedule
+            .iter()
+            .fold(0u64, |sum, step| sum.saturating_add(step.estimated_cycles));
+        if mapping.pipeline.is_empty() {
+            if mapping.makespan_cycles != sequential {
+                return Err(invalid(format!(
+                    "unpipelined mapping records makespan {} but the schedule sums to {sequential}",
+                    mapping.makespan_cycles
+                )));
+            }
+        } else {
+            if mapping.makespan_cycles >= sequential {
+                return Err(invalid(format!(
+                    "pipelined mapping records makespan {} which is not below the sequential sum \
+                     {sequential}",
+                    mapping.makespan_cycles
+                )));
+            }
+            if let Some(resources) = self.resources {
+                if resources.frame_cycles != mapping.makespan_cycles {
+                    return Err(invalid(format!(
+                        "frame cycles {} do not match the pipelined makespan {}",
+                        resources.frame_cycles, mapping.makespan_cycles
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate the artifact's structure and, when feasible, its budgets.
     pub fn validate(&self) -> Result<(), LayoutError> {
         if self.format != LAYOUT_FORMAT {
@@ -1834,12 +2322,32 @@ impl LayoutArtifact {
                 found: self.format.clone(),
             });
         }
-        if self.schema_version != LAYOUT_SCHEMA_VERSION {
+        if self.schema_version != LAYOUT_SCHEMA_VERSION
+            && self.schema_version != LAYOUT_SCHEMA_VERSION_V2
+        {
             return Err(LayoutError::UnsupportedSchema {
                 found: self.schema_version,
-                supported: LAYOUT_SCHEMA_VERSION,
+                supported: LAYOUT_SCHEMA_VERSION_V2,
             });
         }
+        // The schema and the mapping go together: version 2 *is* the mapped
+        // organization, version 1 is the single-engine one and must stay
+        // byte-identical, so it may never grow a mapping.
+        match (self.schema_version, &self.mapping) {
+            (LAYOUT_SCHEMA_VERSION_V2, None) => {
+                return Err(LayoutError::Invalid {
+                    detail: "schema 2 requires a hardware mapping".into(),
+                });
+            }
+            (LAYOUT_SCHEMA_VERSION, Some(_)) => {
+                return Err(LayoutError::Invalid {
+                    detail: "schema 1 must not carry a hardware mapping".into(),
+                });
+            }
+            _ => {}
+        }
+        let mapped = self.schema_version == LAYOUT_SCHEMA_VERSION_V2;
+        self.validate_mapping(mapped)?;
 
         // The recorded certainty must follow from the recorded search outcome:
         // a truncated search can never be labeled optimal or proven-infeasible,
@@ -2121,20 +2629,27 @@ impl LayoutArtifact {
                         detail: "feasible artifact instantiates zero engine lanes".into(),
                     });
                 }
-                for step in &self.schedule {
-                    let lanes = u64::from(step.simd)
-                        .saturating_mul(u64::from(step.pe))
-                        .saturating_mul(u64::from(step.tap_parallel));
-                    if lanes > selection.engine.lanes() {
-                        return Err(LayoutError::Invalid {
-                            detail: format!(
-                                "step {} ({}) uses {lanes} lanes but the engine only instantiates \
-                                 {}",
-                                step.step,
-                                step.op,
-                                selection.engine.lanes()
-                            ),
-                        });
+                if mapped {
+                    // Schema 2 binds each step to its own engine and the binding
+                    // lane bound is checked in `validate_mapping`; the selection
+                    // engine is only the widest-instance summary, so it must not
+                    // be used as a global lane ceiling here.
+                } else {
+                    for step in &self.schedule {
+                        let lanes = u64::from(step.simd)
+                            .saturating_mul(u64::from(step.pe))
+                            .saturating_mul(u64::from(step.tap_parallel));
+                        if lanes > selection.engine.lanes() {
+                            return Err(LayoutError::Invalid {
+                                detail: format!(
+                                    "step {} ({}) uses {lanes} lanes but the engine only instantiates \
+                                     {}",
+                                    step.step,
+                                    step.op,
+                                    selection.engine.lanes()
+                                ),
+                            });
+                        }
                     }
                 }
                 if !cycles.is_consistent() {
@@ -2143,9 +2658,10 @@ impl LayoutArtifact {
                     });
                 }
                 let recomputed = self.recomputed_cycles();
-                if recomputed.mac_cycles != cycles.mac_cycles
-                    || recomputed.setup_cycles != cycles.setup_cycles
-                    || recomputed.total_cycles != cycles.total_cycles
+                if !mapped
+                    && (recomputed.mac_cycles != cycles.mac_cycles
+                        || recomputed.setup_cycles != cycles.setup_cycles
+                        || recomputed.total_cycles != cycles.total_cycles)
                 {
                     return Err(LayoutError::Invalid {
                         detail: format!(
@@ -2270,6 +2786,7 @@ impl LayoutArtifact {
             weights,
             resources,
             cycles,
+            mapping: self.mapping.clone(),
         })
     }
 }
@@ -2306,6 +2823,9 @@ pub struct ExecutionPlan {
     pub resources: ResourceEstimate,
     /// Frame cycle decomposition behind `resources.frame_cycles`.
     pub cycles: CycleBreakdown,
+    /// Solved hardware mapping, present only for a schema-2 layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapping: Option<HardwareMapping>,
 }
 
 impl ExecutionPlan {
@@ -2596,6 +3116,7 @@ mod tests {
                 truncated_candidates: 0,
                 truncated: false,
             },
+            mapping: None,
         }
     }
 

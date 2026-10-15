@@ -29,7 +29,7 @@ The first target is Efinix Titanium Ti60, using the existing `nngen` / `fpga_st_
 
 - **[CLI reference](docs/cli.md)** — commands, stage directory contents, and the examples below.
 - [Developer setup](docs/developer-setup.md) — default build, the optional `melior`/LLVM 23 toolchain, Verilator, fixture regeneration.
-- [Concept book](docs/concept-book.md), [hardware constraint language](docs/constraint-language.md), [versioning standard](VERSIONING.md), [quality standard](QUALITY.md).
+- [Concept book](docs/concept-book.md), [hardware constraint language](docs/constraint-language.md), [mapping solver](docs/solver.md), [versioning standard](VERSIONING.md), [quality standard](QUALITY.md).
 - ADRs: [0001](docs/adr/0001-rust-mlir-boundary.md) Rust/Melior boundary, [0002](docs/adr/0002-persisted-compiler-stages.md) persisted stages, [0003](docs/adr/0003-stream-interfaces-and-the-v1-rtl-envelope.md) stream interfaces and the v1 RTL envelope.
 
 Implemented end to end:
@@ -38,7 +38,8 @@ Implemented end to end:
 - **MLIR** (`src/mlir*.rs`) — deterministic tensor-level MLIR emission for the v1 operator subset, plus the pinned Melior 0.28.2 pass pipeline behind the optional `melior` feature.
 - **Lowering** (`src/lower.rs`) — Graph IR to the planner's typed primitive graph, including fixed-point requantization serialization that preserves per-output-channel multipliers.
 - **Planner** (`src/target.rs`, `src/planner.rs`, `src/layout.rs`) — Ti60 target model and layout search over execution mode, granularity, folding, fusion and memory placement, with rejected-candidate reporting and a validated `tessera.layout` artifact.
-- **RTL** (`src/rtl.rs`, `src/rtl/full.rs`, `src/weights.rs`) — SystemVerilog emission with a self-checking testbench and a Verilator simulation path, for two envelopes: a single streaming pointwise-dot step, and whole models through a static-schedule FSM over an activation arena with one shared MAC array. Anything outside both is rejected by step name.
+- **Mapping solver** (`src/solver/`) — a joint solve of engine count, operator binding, fold, schedule, pipeline cuts and arena placement through a solver-agnostic constraint model and an in-process CP-SAT backend (OR-Tools C++ through `cpsat-rs`), with independent verification and schema-2 lowering. See [docs/solver.md](docs/solver.md).
+- **RTL** (`src/rtl.rs`, `src/rtl/full.rs`, `src/rtl/mapped.rs`, `src/weights.rs`) — SystemVerilog emission with a self-checking testbench and a Verilator simulation path, for three envelopes: a single streaming pointwise-dot step, whole models through a static-schedule FSM over an activation arena with one shared MAC array, and schema-2 mapped plans with per-engine arrays, time-multiplexing and optional pipeline FIFOs. Anything outside them is rejected by step name.
 - **Verification** (`src/stages.rs`) — artifact detection, cross-stage provenance re-checks, and deterministic output checks.
 
 The W8 example solves to a valid seven-step shared-tile layout under
@@ -48,7 +49,10 @@ measurement (see [concept book](docs/concept-book.md) §8 and §11).
 
 ## Quick start
 
-Everything below uses checked-in fixtures and needs no external model files:
+The default `cargo build` links the native CP-SAT backend, so it needs the
+OR-Tools C++ 9.15 and `protoc` prerequisites described in
+[Developer setup](docs/developer-setup.md) before the build below. Everything
+after that uses checked-in fixtures and needs no external model files:
 
 ```sh
 cargo build --release
@@ -74,7 +78,16 @@ cargo build --release
 
 ## Development
 
+The default build links the native CP-SAT backend, so it needs OR-Tools C++ 9.15
+and `protoc`; `ORTOOLS_PREFIX` (default search: the usual prefixes, then
+`/opt/ortools`) selects the installation, and its `lib` must be on the loader
+path for anything that links the backend — the mapping-solver tests today (see
+[developer setup](docs/developer-setup.md)):
+
 ```sh
+export ORTOOLS_PREFIX=/opt/ortools
+export LD_LIBRARY_PATH="$ORTOOLS_PREFIX/lib:$LD_LIBRARY_PATH"
+
 cargo fmt --all --check
 cargo check --all-targets
 cargo test  --all-targets

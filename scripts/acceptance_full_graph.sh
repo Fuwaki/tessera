@@ -32,10 +32,20 @@
 # TABLEGEN_230_PREFIX to an LLVM/MLIR 23.x prefix before invoking this script
 # when it builds with `--features melior` (see docs/developer-setup.md).
 #
+# The CP-SAT backend links OR-Tools dynamically. When ORTOOLS_PREFIX names the
+# installation, its `lib` is prepended to the loader path below; a binary that
+# links the backend — the mapping-solver tests, or the CLI once it solves a
+# mapping — cannot start without it (see docs/developer-setup.md).
+#
 # Nothing here uses Python: the runtime smoke path is the Rust binary plus this
 # shell script.
 
 set -u
+
+if [ -n "${ORTOOLS_PREFIX:-}" ]; then
+    LD_LIBRARY_PATH="$ORTOOLS_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH
+fi
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 FIXTURES="$ROOT/fixtures"

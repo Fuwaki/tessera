@@ -1982,6 +1982,7 @@ pub fn lower_full_graph_with_frames(
         ],
         bundle_digest,
         full_graph: Some(full_graph_summary(model, &semantic_notes)),
+        mapped: None,
     };
     let metadata_json =
         serde_json::to_string_pretty(&metadata).map_err(|source| RtlError::Serialize {

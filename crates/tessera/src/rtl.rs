@@ -91,7 +91,10 @@ use crate::layout::{
 };
 
 pub mod full;
+pub mod mapped;
 pub mod reference;
+
+pub use mapped::{MappedSummary, lower_mapped};
 
 /// Format tag stamped into the serialized RTL bundle metadata.
 pub const RTL_BUNDLE_FORMAT: &str = "tessera.rtl_bundle";
@@ -1228,6 +1231,10 @@ pub struct RtlMetadata {
     /// plan's estimates. `None` for the single-kernel pointwise envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_graph: Option<full::FullGraphSummary>,
+    /// Present only for the mapped multi-engine backend: the generated engine
+    /// instances, multiplier lanes, pipeline links and shared arena.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped: Option<mapped::MappedSummary>,
 }
 
 /// The emitted artifact bundle: sources plus metadata.
@@ -1492,6 +1499,7 @@ impl SystemVerilogBackend {
             ],
             bundle_digest,
             full_graph: None,
+            mapped: None,
         };
 
         let metadata_json =
@@ -3037,6 +3045,7 @@ mod tests {
                 total_cycles: 12_345,
             },
             resources: ResourceEstimate::ZERO,
+            mapping: None,
         }
     }
 
