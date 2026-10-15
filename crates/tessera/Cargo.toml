@@ -16,15 +16,14 @@ clap = { version = "4", features = ["derive"] }
 cpsat-rs = "=0.1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Optional in-process MLIR. Pinned exactly: both the pass names and the Melior
-# API used by `src/mlir/pipeline.rs` are release specific. Requires an
-# LLVM/MLIR 23.x installation discoverable through `MLIR_SYS_230_PREFIX`
-# (see docs/developer-setup.md); the default build never touches it.
-melior = { version = "=0.28.2", optional = true }
-
-[features]
-default = []
-melior = ["dep:melior"]
+# In-process MLIR. Pinned exactly: both the pass names and the Melior API used
+# by `src/mlir/` are release specific. Requires an LLVM/MLIR 23.x installation
+# discoverable through `MLIR_SYS_230_PREFIX` / `TABLEGEN_230_PREFIX` (see
+# docs/developer-setup.md).
+melior = "=0.28.2"
+# CIRCT C API (hw/comb/seq/sv/esi + ExportVerilog), linked into the same MLIR.
+circt-sys = { path = "../circt-sys" }
+mlir-sys = "=230.0.2"
 
 [[bin]]
 name = "tessera"

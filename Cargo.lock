@@ -133,6 +133,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "circt-sys"
+version = "0.1.0"
+dependencies = [
+ "mlir-sys",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -765,9 +772,11 @@ name = "tessera"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "circt-sys",
  "clap",
  "cpsat-rs",
  "melior",
+ "mlir-sys",
  "serde",
  "serde_json",
 ]

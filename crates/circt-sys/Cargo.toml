@@ -1,0 +1,11 @@
+[package]
+name = "circt-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Minimal FFI bindings to the CIRCT C API (hw/comb/seq/sv/esi, ExportVerilog)"
+links = "circt"
+
+[dependencies]
+# Same mlir-sys as melior 0.28.2, so CIRCT and Tessera share one MLIR.
+mlir-sys = "=230.0.2"

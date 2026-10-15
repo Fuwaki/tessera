@@ -19,9 +19,12 @@ export LD_LIBRARY_PATH="$ORTOOLS_PREFIX/lib:$LD_LIBRARY_PATH"
 
 cargo build
 cargo test
-cargo run -p tessera -- solve --primitive fixtures/pointwise/plan_input.json \
+# After import / emit-mlir / dialect annotation (see docs/cli.md):
+cargo run -p tessera -- solve --tessera build/w8/tessera.mlir \
     --target fixtures/targets/ti60f225.toml \
-    --policy fixtures/policies/streaming.toml --out build/pointwise
+    --policy fixtures/policies/emit.toml --out build/w8
+cargo run -p tessera -- emit --tessera build/w8/solved.mlir \
+    --graph build/w8/graph.tgraph --out build/w8
 ```
 
 `ORTOOLS_PREFIX` is read at *build* time, but `libortools.so` is linked
@@ -122,7 +125,7 @@ verified result.
 ## Fixtures
 
 `fixtures/` holds the committed examples: a synthetic W8 manifest with its
-weight blob, a single-step pointwise primitive graph with its weight blob, and
+weight blob, dialect / MLIR fixtures used by the CIRCT hybrid path, and
 the reference Ti60 target plus two policies. Regenerate them all from the same
 Rust types the compiler loads:
 
