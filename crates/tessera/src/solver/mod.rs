@@ -17,6 +17,8 @@
 mod backend;
 pub mod candidates;
 pub mod check;
+pub mod dialect;
+pub use dialect::{DialectSolve, solve_tessera};
 pub mod encode;
 pub mod lower;
 pub mod model;
@@ -29,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::graph::Graph;
 use crate::layout::{
     Activation, ActivationKind, CodeRange, ElemType, ExecutionMode, Granularity, LAYOUT_FORMAT,
-    LAYOUT_SCHEMA_VERSION, LayoutArtifact, LayoutError, MemoryPlacement, OpKind, PlanCertainty,
+    LAYOUT_SCHEMA_VERSION_V2, LayoutArtifact, LayoutError, MemoryPlacement, OpKind, PlanCertainty,
     PlanLimits, PlanStatus, Provenance, RejectReason, RejectedCandidate, RejectionSummary, Requant,
     Rounding, SearchStats, TensorId, TensorRef, TensorShape,
 };
@@ -124,6 +126,45 @@ impl Default for MappingBounds {
                 tap_parallel: 1,
             }],
         }
+    }
+}
+
+impl MappingBounds {
+    /// Default hybrid search window for a Ti60 solve.
+    ///
+    /// Opens unit plus power-of-two SIMD/PE products up to 64 lanes, an engine
+    /// count capped by the usable DSP budget, and optional pipeline cuts. The
+    /// solver still chooses dedicated vs shared and the actual counts.
+    pub fn hybrid_for(target: &Ti60Target, _policy: &Policy) -> Result<Self, SolverError> {
+        let usable = target.usable_budget()?;
+        let max_engines = u32::try_from(usable.dsp48.get().clamp(1, 32)).unwrap_or(32);
+        let mut shapes = Vec::new();
+        for simd in [1u32, 2, 4, 8, 16] {
+            for pe in [1u32, 2, 4, 8, 16] {
+                if simd.saturating_mul(pe) > 64 {
+                    continue;
+                }
+                shapes.push(SpatialShape {
+                    simd,
+                    pe,
+                    tap_parallel: 1,
+                });
+            }
+        }
+        shapes.sort();
+        shapes.dedup();
+        Ok(Self {
+            min_engines: 1,
+            max_engines,
+            min_lanes_per_engine: 1,
+            max_lanes_per_engine: 64,
+            min_pipeline_links: 0,
+            max_pipeline_links: max_engines.saturating_sub(1),
+            min_dedicated_engines: 0,
+            min_shared_engines: 0,
+            max_arena_words: 1 << 20,
+            shapes,
+        })
     }
 }
 
@@ -356,52 +397,153 @@ fn plan_op(
             detail: format!("operator {:?} references unknown tensor {id}", op.name),
         })
     };
-    let detail = match &op.detail {
-        OpDetail::Conv(detail) => detail,
-        _ => {
-            return Err(SolverError::InvalidInput {
-                detail: format!(
-                    "operator {:?} is not a convolution; the mapping solver only binds convolutions",
-                    op.name
-                ),
-            });
-        }
-    };
-    if !op.kind.is_convolution() {
-        return Err(SolverError::InvalidInput {
-            detail: format!("operator {:?} is not a convolution kind", op.name),
-        });
-    }
-    let input_desc = tensor(op.inputs[0])?;
-    let output_desc = tensor(op.outputs[0])?;
-    let weight_desc = tensor(detail.weights)?;
+    let input_desc = tensor(*op.inputs.first().ok_or_else(|| SolverError::InvalidInput {
+        detail: format!("operator {:?} has no inputs", op.name),
+    })?)?;
+    let output_desc = tensor(*op.outputs.first().ok_or_else(|| SolverError::InvalidInput {
+        detail: format!("operator {:?} has no outputs", op.name),
+    })?)?;
     let in_channels = input_desc.shape.c;
     let out_channels = output_desc.shape.c;
-    let kernel = [weight_desc.shape.h, weight_desc.shape.w];
     let in_spatial = [input_desc.shape.h, input_desc.shape.w];
     let out_spatial = [output_desc.shape.h, output_desc.shape.w];
-    let macs = (out_spatial[0] as u64)
-        .saturating_mul(out_spatial[1] as u64)
-        .saturating_mul(in_channels as u64)
-        .saturating_mul(out_channels as u64)
-        .saturating_mul(kernel[0] as u64)
-        .saturating_mul(kernel[1] as u64);
-    let candidates = candidates_for(in_channels, out_channels, macs, bounds);
-    let weights = Some(TensorRef {
-        id: weight_desc.id,
-        name: weight_desc.name.clone(),
-        shape: weight_desc.shape,
-        elem: weight_desc.elem,
-    });
-    let bias = detail
-        .bias
-        .and_then(|id| input.tensor(id))
-        .map(|t| TensorRef {
-            id: t.id,
-            name: t.name.clone(),
-            shape: t.shape,
-            elem: t.elem,
+
+    match &op.detail {
+        OpDetail::Conv(detail) => {
+            if !op.kind.is_convolution() {
+                return Err(SolverError::InvalidInput {
+                    detail: format!("operator {:?} is not a convolution kind", op.name),
+                });
+            }
+            let weight_desc = tensor(detail.weights)?;
+            let kernel = [weight_desc.shape.h, weight_desc.shape.w];
+            // Depthwise: each output channel reduces over one input channel and the
+            // kernel taps, not over the full in_channels*out_channels product.
+            let reduction_channels = if op.kind == OpKind::DepthwiseConv2d {
+                1u64
+            } else {
+                u64::from(in_channels)
+            };
+            let macs = (out_spatial[0] as u64)
+                .saturating_mul(out_spatial[1] as u64)
+                .saturating_mul(reduction_channels)
+                .saturating_mul(u64::from(out_channels))
+                .saturating_mul(u64::from(kernel[0]))
+                .saturating_mul(u64::from(kernel[1]));
+            let candidates = candidates_for(in_channels, out_channels, macs, bounds);
+            let weights = Some(TensorRef {
+                id: weight_desc.id,
+                name: weight_desc.name.clone(),
+                shape: weight_desc.shape,
+                elem: weight_desc.elem,
+            });
+            let bias = detail
+                .bias
+                .and_then(|id| input.tensor(id))
+                .map(|t| TensorRef {
+                    id: t.id,
+                    name: t.name.clone(),
+                    shape: t.shape,
+                    elem: t.elem,
+                });
+            Ok(PlanOp {
+                name: op.name.clone(),
+                kind: op.kind,
+                in_channels,
+                out_channels,
+                in_spatial,
+                out_spatial,
+                kernel,
+                groups: detail.groups,
+                stride: detail.stride,
+                requant: Some(detail.requant.clone()),
+                activation: detail.activation,
+                weights,
+                bias,
+                inputs: op.inputs.clone(),
+                outputs: op.outputs.clone(),
+                in_code_range: input_desc.code_range,
+                out_code_range: output_desc.code_range,
+                macs,
+                candidates,
+            })
+        }
+        OpDetail::Elementwise(detail) => {
+            plan_elementwise(
+                op,
+                bounds,
+                input_desc,
+                output_desc,
+                in_channels,
+                out_channels,
+                in_spatial,
+                out_spatial,
+                detail.requant.clone(),
+                detail.activation,
+            )
+        }
+        OpDetail::Upsample(_) => {
+            plan_elementwise(
+                op,
+                bounds,
+                input_desc,
+                output_desc,
+                in_channels,
+                out_channels,
+                in_spatial,
+                out_spatial,
+                None,
+                Activation {
+                    kind: crate::layout::ActivationKind::None,
+                    clamp_lo: i32::MIN,
+                    clamp_hi: i32::MAX,
+                },
+            )
+        }
+    }
+}
+
+fn plan_elementwise(
+    op: &PrimitiveOp,
+    bounds: &MappingBounds,
+    input_desc: &crate::planner::TensorDesc,
+    output_desc: &crate::planner::TensorDesc,
+    in_channels: u32,
+    out_channels: u32,
+    in_spatial: [u32; 2],
+    out_spatial: [u32; 2],
+    requant: Option<Requant>,
+    activation: Activation,
+) -> Result<PlanOp, SolverError> {
+    // Elementwise / upsample / quantize: one code per cycle on a unit engine.
+    let work = match op.kind {
+        OpKind::Add => 2u64.saturating_mul(output_desc.shape.elements()),
+        _ => output_desc.shape.elements(),
+    };
+    let unit = SpatialShape {
+        simd: 1,
+        pe: 1,
+        tap_parallel: 1,
+    };
+    if !bounds.shapes.is_empty() && !bounds.shapes.contains(&unit) {
+        return Err(SolverError::InvalidInput {
+            detail: format!(
+                "operator {:?} needs the unit shape (simd=pe=tap=1), which is not in the                  enumerated shapes",
+                op.name
+            ),
         });
+    }
+    let lanes = 1u64;
+    if lanes < u64::from(bounds.min_lanes_per_engine)
+        || lanes > u64::from(bounds.max_lanes_per_engine)
+    {
+        return Err(SolverError::InvalidInput {
+            detail: format!(
+                "operator {:?} needs one lane, outside the per-engine lane bounds [{}, {}]",
+                op.name, bounds.min_lanes_per_engine, bounds.max_lanes_per_engine
+            ),
+        });
+    }
     Ok(PlanOp {
         name: op.name.clone(),
         kind: op.kind,
@@ -409,19 +551,23 @@ fn plan_op(
         out_channels,
         in_spatial,
         out_spatial,
-        kernel,
-        groups: detail.groups,
-        stride: detail.stride,
-        requant: Some(detail.requant.clone()),
-        activation: detail.activation,
-        weights,
-        bias,
+        kernel: [1, 1],
+        groups: 1,
+        stride: [1, 1],
+        requant,
+        activation,
+        weights: None,
+        bias: None,
         inputs: op.inputs.clone(),
         outputs: op.outputs.clone(),
         in_code_range: input_desc.code_range,
         out_code_range: output_desc.code_range,
-        macs,
-        candidates,
+        macs: work,
+        candidates: vec![Candidate {
+            shape: unit,
+            lanes,
+            temporal_iterations: work,
+        }],
     })
 }
 
@@ -580,7 +726,7 @@ fn infeasible_artifact(
     };
     let mut artifact = LayoutArtifact {
         format: LAYOUT_FORMAT.into(),
-        schema_version: LAYOUT_SCHEMA_VERSION,
+        schema_version: LAYOUT_SCHEMA_VERSION_V2,
         status: PlanStatus::Infeasible,
         certainty: PlanCertainty::from_search(PlanStatus::Infeasible, false),
         provenance,

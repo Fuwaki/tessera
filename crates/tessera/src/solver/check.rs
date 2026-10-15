@@ -12,7 +12,7 @@
 
 use crate::layout::{ArenaRange, BufferKind, EngineRole, TensorId};
 use crate::solver::SolverError;
-use crate::solver::encode::{Problem, Solution, SolvedBinding, SolvedEngine, SolvedLink};
+use crate::solver::encode::{Problem, Solution, SolvedBinding, SolvedEngine, SolvedLink, SolvedSegment};
 use crate::target::Ti60Target;
 
 /// A verified tensor residence.
@@ -45,6 +45,8 @@ pub struct Checked {
     pub links: Vec<SolvedLink>,
     /// Tensor residences.
     pub residences: Vec<CheckedResidence>,
+    /// Frame-pipeline segments chosen by CP-SAT.
+    pub segments: Vec<SolvedSegment>,
     /// Critical-path frame length in cycles.
     pub makespan_cycles: u64,
     /// Frame DSP48 blocks, recomputed from the target.
@@ -417,12 +419,90 @@ pub fn verify(
         dsp48 = dsp48.saturating_add(problem.engine_dsp(target, engine.shape));
     }
 
+    // ---- segments ---------------------------------------------------------
+    {
+        let mut covered = vec![false; ops];
+        for (si, seg) in solution.segments.iter().enumerate() {
+            if seg.ops.is_empty() {
+                return Err(fail(format!("segment {si} is empty")));
+            }
+            // Contiguity in operator order.
+            let mut sorted = seg.ops.clone();
+            sorted.sort_unstable();
+            if sorted != seg.ops.iter().copied().collect::<Vec<_>>() {
+                // ops should already be in topo order; also require contiguous indices
+            }
+            if sorted.last().unwrap() - sorted.first().unwrap() + 1 != sorted.len() {
+                return Err(fail(format!(
+                    "segment {si} ops {sorted:?} are not contiguous in topological order"
+                )));
+            }
+            for &op in &seg.ops {
+                if op >= ops {
+                    return Err(fail(format!("segment {si} references op {op}")));
+                }
+                if covered[op] {
+                    return Err(fail(format!("operator {op} is in two segments")));
+                }
+                covered[op] = true;
+            }
+            if seg.shared {
+                if seg.engines.len() != 1 {
+                    return Err(fail(format!("shared segment {si} must use exactly one engine")));
+                }
+                let slot = seg.engines[0];
+                if solution.engines.get(slot).map(|e| e.dedicated).unwrap_or(true) {
+                    return Err(fail(format!("shared segment {si} engine slot {slot} is dedicated")));
+                }
+                for &op in &seg.ops {
+                    let bound = engine_slot_of_op(op)?;
+                    if bound != slot {
+                        return Err(fail(format!(
+                            "shared segment {si} op {op} is on slot {bound}, not {slot}"
+                        )));
+                    }
+                }
+            } else {
+                for &op in &seg.ops {
+                    let slot = engine_slot_of_op(op)?;
+                    if !solution.engines.get(slot).map(|e| e.dedicated).unwrap_or(false) {
+                        return Err(fail(format!(
+                            "dedicated segment {si} op {op} is on a shared engine"
+                        )));
+                    }
+                }
+            }
+        }
+        if covered.iter().any(|c| !*c) {
+            return Err(fail("not every operator is in a segment"));
+        }
+        // Edges only go forward across segments.
+        let seg_of: Vec<u32> = {
+            let mut v = vec![0u32; ops];
+            for seg in &solution.segments {
+                for &op in &seg.ops {
+                    v[op] = seg.id;
+                }
+            }
+            v
+        };
+        for edge in &problem.edges {
+            if seg_of[edge.producer] > seg_of[edge.consumer] {
+                return Err(fail(format!(
+                    "segment order reverses edge {} -> {}",
+                    edge.producer, edge.consumer
+                )));
+            }
+        }
+    }
+
     Ok(Checked {
         slots: slot_of.clone(),
         engines,
         bindings: solution.bindings.clone(),
         links: solution.links.clone(),
         residences,
+        segments: solution.segments.clone(),
         makespan_cycles,
         dsp48,
         arena_words,

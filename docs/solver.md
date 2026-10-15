@@ -177,7 +177,10 @@ requant multiplier.
 
 ## Scope
 
-This solver handles the same operator envelope as the mapped RTL backend:
-convolutions with `tap_parallel = 1`. Non-convolution operators are an error, not
-a silently approximated plan. There is no DDR/DMA modelling, no synthesis flow
-and no other FPGA vendor.
+This solver decides mapping on the Tessera dialect (engines, binds, folds,
+schedule, buffers). Those decisions live in `solved.mlir` and are reflected in
+CIRCT hybrid RTL as `engines_busy` one-hot on the sole `*_sched_core` datapath —
+not as separate per-engine FSMs. The operator envelope matches what
+`*_sched_core` can evaluate (convs with the solver's lane rules, add, upsample,
+quantize). There is no DDR/DMA modelling, no synthesis flow and no other FPGA
+vendor.

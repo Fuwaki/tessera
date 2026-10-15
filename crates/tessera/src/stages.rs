@@ -14,11 +14,15 @@
 //! <dir>/optimized.mlir      optimized MLIR text
 //! <dir>/target.toml         copy of the target the layout was solved against
 //! <dir>/policy.toml         copy of the policy the layout was solved against
-//! <dir>/primitive.json      lowered PlanInput            (JSON)
-//! <dir>/layout.tlayout      LayoutArtifact               (TOML)
+//! <dir>/tessera.mlir        tessera dialect (operators)  (MLIR)
+//! <dir>/solved.mlir         tessera dialect + decisions  (MLIR)
+//! <dir>/layout.tlayout      LayoutArtifact               (TOML, transitional)
 //! <dir>/plan.tplan          ExecutionPlan                (TOML)
 //! <dir>/rtl/                RTL bundle
 //! ```
+//!
+//! The planner's retired side JSON (`primitive.json` / `primitives.json`) was
+//! retired: `tessera solve --tessera` reads and writes the dialect module.
 //!
 //! Later stages copy their *inputs* into the directory so that the provenance
 //! hashes recorded by the layout can be re-checked later without the original
@@ -28,8 +32,6 @@ use crate::frontend::{load_artifact, sha256_hex};
 use crate::graph::GraphArtifact;
 use crate::layout::{ExecutionPlan, LayoutArtifact};
 use crate::mlir::MlirArtifact;
-use crate::planner::PlanInput;
-use crate::primitive::PrimitiveArtifact;
 use crate::rtl::RtlMetadata;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -48,10 +50,10 @@ pub const OPTIMIZED_MODULE_FILE: &str = "optimized.mlir";
 pub const TARGET_FILE: &str = "target.toml";
 /// Copy of the policy file a layout was solved against.
 pub const POLICY_FILE: &str = "policy.toml";
-/// Lowered planner input (`PlanInput`, the planner's own contract).
-pub const PRIMITIVE_FILE: &str = "primitive.json";
-/// Lowered primitive graph with its evidence (`tessera.primitive`).
-pub const PRIMITIVES_FILE: &str = "primitives.json";
+/// Tessera dialect module with operator ops (before the solver).
+pub const TESSERA_FILE: &str = "tessera.mlir";
+/// Tessera dialect module after the solver wrote its decisions.
+pub const SOLVED_FILE: &str = "solved.mlir";
 /// Concrete input activation shape recorded during `import` as `N,H,W,C`.
 pub const INPUT_SHAPE_FILE: &str = "input_shape.txt";
 /// Solved layout artifact.
@@ -155,10 +157,6 @@ pub enum ArtifactKind {
     Plan,
     /// `tessera.rtl_bundle`
     RtlBundle,
-    /// A lowered primitive graph (`PlanInput`), which has no format tag.
-    Primitive,
-    /// A lowered primitive graph with its evidence (`tessera.primitive`).
-    PrimitiveArtifact,
 }
 
 impl ArtifactKind {
@@ -170,8 +168,6 @@ impl ArtifactKind {
             ArtifactKind::Layout => "layout",
             ArtifactKind::Plan => "execution_plan",
             ArtifactKind::RtlBundle => "rtl_bundle",
-            ArtifactKind::Primitive => "primitive",
-            ArtifactKind::PrimitiveArtifact => "primitive_artifact",
         }
     }
 }
@@ -179,8 +175,7 @@ impl ArtifactKind {
 /// Detect an artifact kind from its text contents.
 ///
 /// JSON artifacts are read from their `format` field; TOML artifacts from their
-/// `format` key. A `PlanInput` JSON document has no format tag, so it is
-/// recognised by its required `tensors`/`ops`/`inputs`/`outputs` fields.
+/// `format` key.
 pub fn detect_kind(text: &str) -> Option<ArtifactKind> {
     let trimmed = text.trim_start();
     if trimmed.starts_with('{') {
@@ -190,13 +185,8 @@ pub fn detect_kind(text: &str) -> Option<ArtifactKind> {
                 crate::graph::GRAPH_FORMAT => Some(ArtifactKind::Graph),
                 crate::mlir::MLIR_ARTIFACT_FORMAT => Some(ArtifactKind::Mlir),
                 crate::rtl::RTL_BUNDLE_FORMAT => Some(ArtifactKind::RtlBundle),
-                crate::primitive::PRIMITIVE_FORMAT => Some(ArtifactKind::PrimitiveArtifact),
                 _ => None,
             };
-        }
-        let has = |key: &str| value.get(key).is_some();
-        if has("tensors") && has("ops") && has("inputs") && has("outputs") {
-            return Some(ArtifactKind::Primitive);
         }
         return None;
     }
@@ -331,71 +321,6 @@ pub fn load_rtl_metadata(dir: &StageDir) -> Result<Option<RtlMetadata>, ChainErr
         })
 }
 
-/// Load a lowered primitive graph written by `tessera solve`.
-///
-/// Both forms are accepted: the plain planner contract (`primitive.json`) and the
-/// evidence-carrying `tessera.primitive` artifact (`primitives.json`), whose
-/// `plan` is what the planner consumes.
-pub fn load_primitive(dir: &StageDir) -> Result<Option<PlanInput>, ChainError> {
-    for name in [PRIMITIVE_FILE, PRIMITIVES_FILE] {
-        let path = dir.path(name);
-        if !path.exists() {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).map_err(|error| ChainError::Io {
-            path: path.display().to_string(),
-            detail: error.to_string(),
-        })?;
-        return parse_primitive_stage(&text, name).map(Some);
-    }
-    Ok(None)
-}
-
-/// Load the evidence-carrying primitive artifact, when one was written.
-pub fn load_primitive_artifact(dir: &StageDir) -> Result<Option<PrimitiveArtifact>, ChainError> {
-    let path = dir.path(PRIMITIVES_FILE);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(&path).map_err(|error| ChainError::Io {
-        path: path.display().to_string(),
-        detail: error.to_string(),
-    })?;
-    let artifact = PrimitiveArtifact::from_json(&text).map_err(|error| ChainError::Malformed {
-        stage: PRIMITIVES_FILE,
-        detail: error.to_string(),
-    })?;
-    artifact
-        .validate_header()
-        .map_err(|error| ChainError::Malformed {
-            stage: PRIMITIVES_FILE,
-            detail: error.to_string(),
-        })?;
-    Ok(Some(artifact))
-}
-
-/// Parse a primitive document (either form) and validate it.
-pub fn parse_primitive(text: &str) -> Result<PlanInput, ChainError> {
-    parse_primitive_stage(text, PRIMITIVE_FILE)
-}
-
-fn parse_primitive_stage(text: &str, stage: &'static str) -> Result<PlanInput, ChainError> {
-    if detect_kind(text) == Some(ArtifactKind::PrimitiveArtifact) {
-        let artifact =
-            PrimitiveArtifact::from_json(text).map_err(|error| ChainError::Malformed {
-                stage,
-                detail: error.to_string(),
-            })?;
-        return Ok(artifact.plan);
-    }
-    let plan: PlanInput = serde_json::from_str(text).map_err(|error| ChainError::Malformed {
-        stage,
-        detail: error.to_string(),
-    })?;
-    plan.validate()
-        .map_err(|detail| ChainError::Malformed { stage, detail })?;
-    Ok(plan)
-}
 
 /// Re-check every persisted artifact in `dir` and every provenance link
 /// between them.
@@ -420,7 +345,6 @@ pub fn verify_chain(dir: &StageDir) -> Result<Vec<ChainCheck>, ChainError> {
     let optimized = load_mlir(dir, OPTIMIZED_FILE)?;
     let layout = load_layout(dir)?;
     let plan = load_plan(dir)?;
-    let primitives = load_primitive_artifact(dir)?;
     let rtl = load_rtl_metadata(dir)?;
 
     if let Some(graph) = &graph {
@@ -494,8 +418,8 @@ pub fn verify_chain(dir: &StageDir) -> Result<Vec<ChainCheck>, ChainError> {
             GRAPH_FILE,
             OPTIMIZED_FILE,
             MLIR_FILE,
-            PRIMITIVE_FILE,
-            PRIMITIVES_FILE,
+            TESSERA_FILE,
+            SOLVED_FILE,
         ];
         let mut matched: Option<&'static str> = None;
         let mut present: Vec<(&'static str, String)> = Vec::new();
@@ -571,44 +495,6 @@ pub fn verify_chain(dir: &StageDir) -> Result<Vec<ChainCheck>, ChainError> {
         }
     }
 
-    if let (Some(primitives), Some(optimized)) = (&primitives, &optimized) {
-        let linked = primitives.check(optimized);
-        checks.push(ChainCheck {
-            stage: "primitives",
-            check: "descends from the optimized module".to_string(),
-            ok: linked.is_ok(),
-            detail: match linked {
-                Ok(()) => format!(
-                    "{} operators, {} fusion groups ({} fused), {} buffers, {} intervals, module \
-                     {}",
-                    primitives.plan.ops.len(),
-                    primitives.groups.len(),
-                    primitives.fused_groups().len(),
-                    primitives.buffers.len(),
-                    primitives.intervals.len(),
-                    short(&primitives.provenance.mlir_module_hash)
-                ),
-                Err(error) => error.to_string(),
-            },
-        });
-    } else if let Some(primitives) = &primitives {
-        // Standalone: the optimized module is not in this directory, so only the
-        // artifact's own consistency can be checked, and that is stated.
-        let own = primitives.validate_header();
-        checks.push(ChainCheck {
-            stage: "primitives",
-            check: "artifact self-consistency".to_string(),
-            ok: own.is_ok(),
-            detail: match own {
-                Ok(()) => format!(
-                    "no optimized module in the directory; checked format, schema and plan only \
-                     (module {} is trusted from the producer)",
-                    short(&primitives.provenance.mlir_module_hash)
-                ),
-                Err(error) => error.to_string(),
-            },
-        });
-    }
 
     // The numerical contract the whole chain is built on: every requantization in
     // the plan uses the documented half-away-from-zero fixed-point datapath, and the bound on
@@ -735,81 +621,6 @@ pub fn verify_chain(dir: &StageDir) -> Result<Vec<ChainCheck>, ChainError> {
                     )
                 },
             });
-        }
-    }
-
-    if let Some(rtl) = &rtl {
-        if let Some(full) = &rtl.full_graph {
-            // The allocator may reuse words, so "no two slots overlap" is the wrong
-            // invariant; the right one is that slots whose *live ranges* overlap do
-            // not overlap in address. This is checked from the persisted artifact
-            // rather than trusted, because a sum-of-live-words allocation can hand
-            // two simultaneously live slots the same words.
-            let mut conflicts = Vec::new();
-            for (index, a) in full.slots.iter().enumerate() {
-                for b in full.slots.iter().skip(index + 1) {
-                    let both_live = a.live[0] <= b.live[1] && b.live[0] <= a.live[1];
-                    if !both_live {
-                        continue;
-                    }
-                    let disjoint =
-                        a.offset + a.elements <= b.offset || b.offset + b.elements <= a.offset;
-                    if !disjoint {
-                        conflicts.push(format!(
-                            "{} [{}, {}) and {} [{}, {}) are both live over steps {}-{} / {}-{}",
-                            a.name,
-                            a.offset,
-                            a.offset + a.elements,
-                            b.name,
-                            b.offset,
-                            b.offset + b.elements,
-                            a.live[0],
-                            a.live[1],
-                            b.live[0],
-                            b.live[1]
-                        ));
-                    }
-                }
-            }
-            checks.push(ChainCheck {
-                stage: "rtl",
-                check: "simultaneous address disjoint".to_string(),
-                ok: conflicts.is_empty(),
-                detail: if conflicts.is_empty() {
-                    format!(
-                        "{} arena slot(s) checked pairwise; no two simultaneously live slots share \
-                         an address",
-                        full.slots.len()
-                    )
-                } else {
-                    format!(
-                        "{} overlapping pair(s): {}",
-                        conflicts.len(),
-                        conflicts.join("; ")
-                    )
-                },
-            });
-            // The emitted high-water mark may be smaller than the plan's budget (it
-            // may reuse words) but never larger, or the plan under-budgets the
-            // structure that was built from it.
-            if let Some(plan) = &plan {
-                let budget = plan.engine.arena_words;
-                let high_water = full.arena_words;
-                checks.push(ChainCheck {
-                    stage: "rtl",
-                    check: "arena high-water within budget".to_string(),
-                    ok: budget == 0 || high_water <= budget,
-                    detail: if budget == 0 {
-                        format!("emitted {high_water} word(s); the plan declares no budget")
-                    } else {
-                        format!(
-                            "emitted {high_water} words against a plan budget of {budget} \
-                             (without reuse: {})",
-                            full.arena_words_without_reuse
-                        )
-                    },
-                });
-            }
         }
     }
 

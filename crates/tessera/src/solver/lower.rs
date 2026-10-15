@@ -11,11 +11,12 @@
 use crate::layout::{
     BufferBinding, BufferKind, BufferRegion, BufferResidence, CycleBreakdown, EngineConfig,
     EngineInstance, EngineRole, HardwareMapping, LAYOUT_FORMAT, LAYOUT_SCHEMA_VERSION_V2,
-    MemoryPlacement, OpAssignment, OpEngineBinding, PaddingSpec, PipelineLink, PlanCertainty,
+    MappingSegment,
+    MemoryPlacement, OpAssignment, OpEngineBinding, OpKind, PaddingSpec, PipelineLink, PlanCertainty,
     PlanLimits, PlanStatus, Provenance, RejectionSummary, ResourceEstimate, ResourceSlack,
     ScheduleStep, SearchStats, Selection, StepCost, TensorRef,
 };
-use crate::planner::{PlanInput, Policy};
+use crate::planner::{OpDetail, Padding, PlanInput, Policy};
 use crate::solver::check::Checked;
 use crate::solver::{Context, SolverError};
 use crate::target::{BufferRequest, Ti60Target};
@@ -186,14 +187,12 @@ pub(crate) fn lower(lower: &LowerInput) -> Result<crate::layout::LayoutArtifact,
             kernel: op.kernel,
             groups: op.groups,
             stride: op.stride,
-            padding: Some(PaddingSpec {
-                top: 0,
-                bottom: 0,
-                left: 0,
-                right: 0,
-                reflect: false,
-            }),
-            upsample_scale: None,
+            padding: padding_spec_for(op, lower.input),
+            upsample_scale: if op.kind == OpKind::NearestUpsample2x {
+                Some(2)
+            } else {
+                None
+            },
             in_code_range: op.in_code_range,
             out_code_range: op.out_code_range,
             requant: op.requant.clone(),
@@ -274,11 +273,34 @@ pub(crate) fn lower(lower: &LowerInput) -> Result<crate::layout::LayoutArtifact,
             consumer_ops: residence.consumer_ops.clone(),
         })
         .collect();
+    let segments: Vec<MappingSegment> = checked
+        .segments
+        .iter()
+        .map(|seg| {
+            let mode = if seg.shared { "shared" } else { "dedicated" };
+            let eng_names: Vec<String> = seg
+                .engines
+                .iter()
+                .map(|slot| {
+                    let ordinal = ordinal_of_slot(*slot).expect("segment engine slot");
+                    engine_names[ordinal].clone()
+                })
+                .collect();
+            MappingSegment {
+                index: seg.id,
+                mode: mode.into(),
+                ops: seg.ops.iter().map(|i| ops[*i].name.clone()).collect(),
+                engines: eng_names,
+                cycles: seg.cycles,
+            }
+        })
+        .collect();
     let mapping = HardwareMapping {
         engines: engines.clone(),
         bindings,
         pipeline,
         buffers: residences,
+        segments,
         makespan_cycles: checked.makespan_cycles,
     };
 
@@ -430,4 +452,54 @@ fn estimate_ram10(
         blocks = blocks.saturating_add(mapping.blocks.get());
     }
     blocks
+}
+
+/// Project a convolution's planner padding onto the layout [`PaddingSpec`].
+fn padding_spec_for(op: &crate::solver::PlanOp, input: &PlanInput) -> Option<PaddingSpec> {
+    if !op.kind.is_convolution() {
+        return None;
+    }
+    let detail = input
+        .ops
+        .iter()
+        .find(|candidate| candidate.name == op.name)
+        .and_then(|prim| match &prim.detail {
+            OpDetail::Conv(detail) => Some(detail),
+            _ => None,
+        });
+    let Some(detail) = detail else {
+        return Some(PaddingSpec::NONE);
+    };
+    Some(match &detail.padding {
+        Padding::Zero {
+            top,
+            bottom,
+            left,
+            right,
+        } => PaddingSpec {
+            top: *top,
+            bottom: *bottom,
+            left: *left,
+            right: *right,
+            reflect: false,
+        },
+        Padding::Reflect | Padding::Same => {
+            let reflect = matches!(detail.padding, Padding::Reflect);
+            let pad_h = ((op.out_spatial[0].saturating_sub(1))
+                .saturating_mul(op.stride[0])
+                .saturating_add(op.kernel[0]))
+            .saturating_sub(op.in_spatial[0]);
+            let pad_w = ((op.out_spatial[1].saturating_sub(1))
+                .saturating_mul(op.stride[1])
+                .saturating_add(op.kernel[1]))
+            .saturating_sub(op.in_spatial[1]);
+            PaddingSpec {
+                top: pad_h / 2,
+                bottom: pad_h - pad_h / 2,
+                left: pad_w / 2,
+                right: pad_w - pad_w / 2,
+                reflect,
+            }
+        }
+    })
 }

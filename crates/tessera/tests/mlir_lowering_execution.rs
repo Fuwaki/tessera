@@ -1043,10 +1043,6 @@ fn check_reference_against_oracle(reference: &Reference<'_>) {
 
 #[test]
 fn the_emitted_ir_executes_and_matches_the_reference_contract() {
-    if !tessera::mlir::melior_available() {
-        skip_or_fail("the native pathway needs the pass pipeline (`melior` feature)");
-        return;
-    }
     let Some(tools) = tools() else {
         skip_or_fail(
             "set MLIR_SYS_230_PREFIX to an LLVM/MLIR 23 installation with `mlir-opt`, \

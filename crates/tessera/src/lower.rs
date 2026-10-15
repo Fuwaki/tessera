@@ -217,50 +217,8 @@ pub struct LowerReport {
     pub weight_tensors: BTreeMap<String, String>,
 }
 
-/// Lower a validated graph into the planner's primitive graph.
-pub fn lower_graph(
-    graph: &Graph,
-    input: InputShape,
-) -> Result<(PlanInput, LowerReport), LowerError> {
-    let shape = crate::graph::TensorShape::try_new(input.channels, input.height, input.width)
-        .map_err(|error| LowerError::Shape {
-            detail: error.to_string(),
-        })?;
-    // The graph's shape report is the graph's own propagation, used here as an
-    // independent cross-check of this module's per-version shape arithmetic.
-    // It is *not* used to size operator outputs: the graph updates points in
-    // place (`add`, `upsample_nearest2x`), so a point has one shape per version
-    // and only the op that writes it knows which version is live.
-    let report = graph.infer_shapes(&shape)?;
-
-    let mut builder = Builder::new(graph, input);
-    for op in graph.ops() {
-        builder.lower_op(op)?;
-    }
-    let (plan, report_out) = builder.finish()?;
-    let computed_image = report_out.image_shape;
-    let graph_image = report.image;
-    if computed_image
-        != (
-            graph_image.channels.get(),
-            graph_image.height.get(),
-            graph_image.width.get(),
-        )
-    {
-        return Err(LowerError::Shape {
-            detail: format!(
-                "lowered image shape {}x{}x{} does not match the graph's own propagation {}x{}x{}",
-                computed_image.0,
-                computed_image.1,
-                computed_image.2,
-                graph_image.channels.get(),
-                graph_image.height.get(),
-                graph_image.width.get()
-            ),
-        });
-    }
-    Ok((plan, report_out.report))
-}
+/// Retired: the planner input is built from tessera dialect ops
+/// (`solver::dialect::problem_from_tessera`), not from the graph IR.
 
 struct Builder<'a> {
     graph: &'a Graph,

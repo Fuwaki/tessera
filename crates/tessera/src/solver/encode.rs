@@ -129,6 +129,23 @@ pub struct SolvedLink {
 pub struct SolvedResidence {
     /// Whether the tensor is arena-resident (false when pipeline-crossed).
     pub arena: bool,
+    /// Banks: 1 = local to a segment, 2 = K-bank rotating across segments.
+    pub banks: u32,
+}
+
+/// One frame-pipeline segment chosen by CP-SAT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SolvedSegment {
+    /// Dense segment id from 0.
+    pub id: u32,
+    /// Operator indices in topological order.
+    pub ops: Vec<usize>,
+    /// Engine slots used by those operators.
+    pub engines: Vec<usize>,
+    /// Whether the segment uses a shared engine.
+    pub shared: bool,
+    /// Cycles = sum (shared) or max (dedicated) of binding durations.
+    pub cycles: u64,
 }
 
 /// The decoded solver assignment.
@@ -142,6 +159,8 @@ pub struct Solution {
     pub links: Vec<SolvedLink>,
     /// Per-tensor arena presence, in `Problem::tensors` order.
     pub residences: Vec<SolvedResidence>,
+    /// Frame-pipeline segments, ordered by dense id.
+    pub segments: Vec<SolvedSegment>,
     /// Frame length from the scheduler.
     pub makespan: i64,
 }
@@ -173,6 +192,17 @@ impl Problem {
             .saturating_add(1)
             .max(1) as i64
     }
+}
+
+
+fn seg_var(i: usize) -> String {
+    format!("seg.{i}")
+}
+fn cross_var(k: usize) -> String {
+    format!("cross.{k}")
+}
+fn kbank_var(t: usize) -> String {
+    format!("kbank.{t}")
 }
 
 fn used(e: usize) -> String {
@@ -511,6 +541,237 @@ pub fn encode(problem: &Problem, target: &Ti60Target) -> ConstraintModel {
         });
     }
 
+    // ---- frame-pipeline segments and K-bank residence --------------------
+    //
+    // Each operator gets a segment id. Data edges only go forward in segment
+    // id, operators that share an engine share a segment, and a segment's
+    // operators form a contiguous block in topological order. A tensor that
+    // crosses segments (or is the graph input) lives in a K-bank buffer;
+    // tensors internal to a segment are local (1 bank).
+    let max_seg = (ops.max(1) - 1) as i64;
+    for i in 0..ops {
+        model.var(Var::integer(seg_var(i), 0, max_seg));
+    }
+    for k in 0..problem.edges.len() {
+        model.var(Var::boolean(cross_var(k)));
+    }
+    for t_i in 0..problem.tensors.len() {
+        model.var(Var::boolean(kbank_var(t_i)));
+    }
+    // Edge: seg_p <= seg_c, and cross <=> seg_c > seg_p.
+    for (k, edge) in problem.edges.iter().enumerate() {
+        let p = edge.producer;
+        let c = edge.consumer;
+        model.constrain(Constraint::Linear {
+            terms: vec![(seg_var(c), 1), (seg_var(p), -1)],
+            rel: Rel::Ge,
+            bound: 0,
+        });
+        model.constrain(Constraint::Linear {
+            terms: vec![(seg_var(c), 1), (seg_var(p), -1), (cross_var(k), -1)],
+            rel: Rel::Ge,
+            bound: 0,
+        });
+        model.constrain(Constraint::Linear {
+            terms: vec![
+                (seg_var(c), 1),
+                (seg_var(p), -1),
+                (cross_var(k), -max_seg.max(1)),
+            ],
+            rel: Rel::Le,
+            bound: 0,
+        });
+    }
+    // Same engine => same segment.
+    let m = max_seg.max(1);
+    for e in 0..engines {
+        for i in 0..ops {
+            for j in (i + 1)..ops {
+                model.constrain(Constraint::Linear {
+                    terms: vec![
+                        (seg_var(i), 1),
+                        (seg_var(j), -1),
+                        (bind_var(i, e), m),
+                        (bind_var(j, e), m),
+                    ],
+                    rel: Rel::Le,
+                    bound: 2 * m,
+                });
+                model.constrain(Constraint::Linear {
+                    terms: vec![
+                        (seg_var(j), 1),
+                        (seg_var(i), -1),
+                        (bind_var(i, e), m),
+                        (bind_var(j, e), m),
+                    ],
+                    rel: Rel::Le,
+                    bound: 2 * m,
+                });
+            }
+        }
+    }
+    // Segment contiguity and |seg_i-seg_j| auxiliaries. gap must equal the
+    // absolute difference (pos/neg split + AtMostOne), otherwise a loose lower
+    // bound lets shared-segment ownership stay vacuous when segs are equal.
+    for i in 0..ops {
+        for j in (i + 1)..ops {
+            let gap = format!("segabs.{i}.{j}");
+            let gap_pos = format!("segpos.{i}.{j}");
+            let gap_neg = format!("segneg.{i}.{j}");
+            let pos_nz = format!("segposnz.{i}.{j}");
+            let neg_nz = format!("segnenz.{i}.{j}");
+            model.var(Var::integer(gap.clone(), 0, m));
+            model.var(Var::integer(gap_pos.clone(), 0, m));
+            model.var(Var::integer(gap_neg.clone(), 0, m));
+            model.var(Var::boolean(pos_nz.clone()));
+            model.var(Var::boolean(neg_nz.clone()));
+            model.constrain(Constraint::AtMostOne {
+                vars: vec![pos_nz.clone(), neg_nz.clone()],
+            });
+            // seg_i - seg_j = gap_pos - gap_neg
+            model.constrain(Constraint::Linear {
+                terms: vec![
+                    (seg_var(i), 1),
+                    (seg_var(j), -1),
+                    (gap_pos.clone(), -1),
+                    (gap_neg.clone(), 1),
+                ],
+                rel: Rel::Eq,
+                bound: 0,
+            });
+            // gap = gap_pos + gap_neg
+            model.constrain(Constraint::Linear {
+                terms: vec![
+                    (gap.clone(), 1),
+                    (gap_pos.clone(), -1),
+                    (gap_neg.clone(), -1),
+                ],
+                rel: Rel::Eq,
+                bound: 0,
+            });
+            // gap_pos <= m*pos_nz, gap_neg <= m*neg_nz, and each is at least its flag
+            model.constrain(Constraint::Linear {
+                terms: vec![(gap_pos.clone(), 1), (pos_nz.clone(), -m)],
+                rel: Rel::Le,
+                bound: 0,
+            });
+            model.constrain(Constraint::Linear {
+                terms: vec![(gap_neg.clone(), 1), (neg_nz.clone(), -m)],
+                rel: Rel::Le,
+                bound: 0,
+            });
+            model.constrain(Constraint::Linear {
+                terms: vec![(gap_pos.clone(), 1), (pos_nz.clone(), -1)],
+                rel: Rel::Ge,
+                bound: 0,
+            });
+            model.constrain(Constraint::Linear {
+                terms: vec![(gap_neg.clone(), 1), (neg_nz.clone(), -1)],
+                rel: Rel::Ge,
+                bound: 0,
+            });
+            for k in (i + 1)..j {
+                model.constrain(Constraint::Linear {
+                    terms: vec![(seg_var(i), 1), (seg_var(k), -1), (gap.clone(), -m)],
+                    rel: Rel::Le,
+                    bound: 0,
+                });
+                model.constrain(Constraint::Linear {
+                    terms: vec![(seg_var(k), 1), (seg_var(i), -1), (gap.clone(), -m)],
+                    rel: Rel::Le,
+                    bound: 0,
+                });
+            }
+        }
+    }
+    // Shared engine in a segment owns every operator of that segment.
+    for e in 0..engines {
+        for i in 0..ops {
+            for j in 0..ops {
+                if i == j {
+                    continue;
+                }
+                let gap = if i < j {
+                    format!("segabs.{i}.{j}")
+                } else {
+                    format!("segabs.{j}.{i}")
+                };
+                // bind_i + shared - gap <= 1 + bind_j
+                // When gap=0 and both antecedents hold, bind_j is forced.
+                model.constrain(Constraint::Linear {
+                    terms: vec![
+                        (bind_var(i, e), 1),
+                        (format!("shared.{e}"), 1),
+                        (gap, -1),
+                        (bind_var(j, e), -1),
+                    ],
+                    rel: Rel::Le,
+                    bound: 1,
+                });
+            }
+        }
+    }
+    // K-bank: graph-input tensors always; produced tensors when any outgoing
+    // edge crosses segments. Local otherwise. Align with the legacy arena xor
+    // link: a cross is a pipeline cut for that edge.
+    for (t_i, tensor) in problem.tensors.iter().enumerate() {
+        match tensor.producer {
+            None => {
+                model.constrain(Constraint::Linear {
+                    terms: vec![(kbank_var(t_i), 1)],
+                    rel: Rel::Eq,
+                    bound: 1,
+                });
+            }
+            Some(_) => {
+                let crosses: Vec<usize> = problem
+                    .edges
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.tensor == tensor.id)
+                    .map(|(k, _)| k)
+                    .collect();
+                if crosses.is_empty() {
+                    // No consumer edge: treat as output-side K-bank.
+                    model.constrain(Constraint::Linear {
+                        terms: vec![(kbank_var(t_i), 1)],
+                        rel: Rel::Eq,
+                        bound: 1,
+                    });
+                } else {
+                    // kbank >= each cross; kbank <= sum(cross)
+                    for &k in &crosses {
+                        model.constrain(Constraint::Linear {
+                            terms: vec![(kbank_var(t_i), 1), (cross_var(k), -1)],
+                            rel: Rel::Ge,
+                            bound: 0,
+                        });
+                    }
+                    let mut terms: Vec<Term> = vec![(kbank_var(t_i), 1)];
+                    for &k in &crosses {
+                        terms.push((cross_var(k), -1));
+                    }
+                    model.constrain(Constraint::Linear {
+                        terms,
+                        rel: Rel::Le,
+                        bound: 0,
+                    });
+                }
+            }
+        }
+        // Tie the legacy link bit to cross for the same edge, so arena / link
+        // accounting stays consistent: link_k == cross_k.
+        for (k, edge) in problem.edges.iter().enumerate() {
+            if edge.tensor == tensor.id {
+                model.constrain(Constraint::Linear {
+                    terms: vec![(link_var(k), 1), (cross_var(k), -1)],
+                    rel: Rel::Eq,
+                    bound: 0,
+                });
+            }
+        }
+    }
+
     // ---- one operator at a time per engine -------------------------------
     for e in 0..engines {
         let intervals: Vec<Interval> = (0..ops)
@@ -694,8 +955,54 @@ pub fn decode(problem: &Problem, values: &BTreeMap<String, i64>) -> Result<Solut
 
     let mut residences = Vec::with_capacity(problem.tensors.len());
     for t in 0..problem.tensors.len() {
+        let kbank = truthy(&kbank_var(t))?;
         residences.push(SolvedResidence {
             arena: truthy(&arena_var(t))?,
+            banks: if kbank { 2 } else { 1 },
+        });
+    }
+
+    let mut raw_seg = Vec::with_capacity(problem.ops.len());
+    for i in 0..problem.ops.len() {
+        raw_seg.push(get(&seg_var(i))? as u32);
+    }
+    // Densify segment ids and build SolvedSegment entries.
+    let mut unique = raw_seg.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    let mut segments = Vec::with_capacity(unique.len());
+    for (dense, &raw) in unique.iter().enumerate() {
+        let op_idxs: Vec<usize> = raw_seg
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s == raw)
+            .map(|(i, _)| i)
+            .collect();
+        let mut eng = Vec::new();
+        let mut shared = false;
+        let mut cycles_shared = 0u64;
+        let mut cycles_ded = 0u64;
+        for &i in &op_idxs {
+            let b = bindings
+                .iter()
+                .find(|b| b.op == i)
+                .expect("binding for segmented op");
+            if !eng.contains(&b.engine) {
+                eng.push(b.engine);
+            }
+            if !engines[b.engine].dedicated {
+                shared = true;
+            }
+            let dur = b.candidate.temporal_iterations.max(1);
+            cycles_shared = cycles_shared.saturating_add(dur);
+            cycles_ded = cycles_ded.max(dur);
+        }
+        segments.push(SolvedSegment {
+            id: dense as u32,
+            ops: op_idxs,
+            engines: eng,
+            shared,
+            cycles: if shared { cycles_shared } else { cycles_ded },
         });
     }
 
@@ -704,6 +1011,7 @@ pub fn decode(problem: &Problem, values: &BTreeMap<String, i64>) -> Result<Solut
         bindings,
         links,
         residences,
+        segments,
         makespan: get("makespan")?,
     })
 }

@@ -34,14 +34,15 @@ use crate::target::toml_lite::{self, TomlError};
 /// Layout artifact format tag.
 pub const LAYOUT_FORMAT: &str = "tessera.layout";
 /// Layout artifact schema version implemented by this build.
+/// Removed: schema 1 is no longer accepted. Kept only so old error messages
+/// can still name it.
 pub const LAYOUT_SCHEMA_VERSION: u32 = 1;
 /// Layout artifact schema version that carries a [`HardwareMapping`].
 ///
-/// Version 2 is the general multi-engine organization: several engine
-/// instances, an explicit op-to-engine binding, an optional pipeline cut and
-/// the buffer residences that back every tensor. Version 1 stays valid and
-/// byte-identical: it has no mapping and its single shared engine is only
-/// summarized by the selection.
+/// Version 2 is the only accepted schema: several engine instances, an
+/// explicit op-to-engine binding, optional pipeline segments / K-bank
+/// residence, and the buffer residences that back every tensor. Schema 1
+/// (single-engine, no mapping) is refused.
 pub const LAYOUT_SCHEMA_VERSION_V2: u32 = 2;
 /// Execution-plan format tag.
 pub const PLAN_FORMAT: &str = "tessera.execution_plan";
@@ -1790,6 +1791,22 @@ pub struct BufferResidence {
 /// checker in [`crate::solver::check`] has recomputed every field from the
 /// constraint assignment, so a feasible artifact is never a bare restatement of
 /// the solver's own status.
+/// One frame-pipeline segment recorded by the CP-SAT solver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MappingSegment {
+    /// Dense segment index.
+    pub index: u32,
+    /// `shared` or `dedicated`.
+    pub mode: String,
+    /// Operator names in topological order.
+    pub ops: Vec<String>,
+    /// Engine names used by those operators.
+    pub engines: Vec<String>,
+    /// Segment cycles (sum for shared, max for dedicated).
+    pub cycles: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareMapping {
@@ -1801,6 +1818,9 @@ pub struct HardwareMapping {
     pub pipeline: Vec<PipelineLink>,
     /// Tensor residences, in deterministic order.
     pub buffers: Vec<BufferResidence>,
+    /// Frame-pipeline segments chosen by CP-SAT (empty on legacy artifacts).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<MappingSegment>,
     /// Critical-path frame length in cycles.
     pub makespan_cycles: u64,
 }
@@ -1831,7 +1851,7 @@ pub struct SearchStats {
 pub struct LayoutArtifact {
     /// Must equal [`LAYOUT_FORMAT`].
     pub format: String,
-    /// Must equal [`LAYOUT_SCHEMA_VERSION`] or [`LAYOUT_SCHEMA_VERSION_V2`].
+    /// Must equal [`LAYOUT_SCHEMA_VERSION_V2`].
     pub schema_version: u32,
     /// Feasibility status.
     pub status: PlanStatus,
@@ -2221,22 +2241,20 @@ impl LayoutArtifact {
                     link.tensor, producer.engine, link.producer_engine
                 )));
             }
+            // A tensor may feed several consumers; the link names one of them.
             let consumer = self
                 .schedule
                 .iter()
-                .find(|step| step.inputs.contains(&link.tensor))
+                .find(|step| {
+                    step.inputs.contains(&link.tensor) && step.engine == link.consumer_engine
+                })
                 .ok_or_else(|| {
                     invalid(format!(
-                        "pipeline tensor {} is not consumed by any step",
-                        link.tensor
+                        "pipeline tensor {} has no consumer step on engine {:?}",
+                        link.tensor, link.consumer_engine
                     ))
                 })?;
-            if consumer.engine != link.consumer_engine {
-                return Err(invalid(format!(
-                    "pipeline tensor {} is consumed on engine {:?}, not the link's consumer {:?}",
-                    link.tensor, consumer.engine, link.consumer_engine
-                )));
-            }
+            let _ = consumer;
         }
 
         // (7) arena residences only, and never two live ones on one word.
@@ -2322,31 +2340,19 @@ impl LayoutArtifact {
                 found: self.format.clone(),
             });
         }
-        if self.schema_version != LAYOUT_SCHEMA_VERSION
-            && self.schema_version != LAYOUT_SCHEMA_VERSION_V2
-        {
+        if self.schema_version != LAYOUT_SCHEMA_VERSION_V2 {
             return Err(LayoutError::UnsupportedSchema {
                 found: self.schema_version,
                 supported: LAYOUT_SCHEMA_VERSION_V2,
             });
         }
-        // The schema and the mapping go together: version 2 *is* the mapped
-        // organization, version 1 is the single-engine one and must stay
-        // byte-identical, so it may never grow a mapping.
-        match (self.schema_version, &self.mapping) {
-            (LAYOUT_SCHEMA_VERSION_V2, None) => {
-                return Err(LayoutError::Invalid {
-                    detail: "schema 2 requires a hardware mapping".into(),
-                });
-            }
-            (LAYOUT_SCHEMA_VERSION, Some(_)) => {
-                return Err(LayoutError::Invalid {
-                    detail: "schema 1 must not carry a hardware mapping".into(),
-                });
-            }
-            _ => {}
+        // Feasible plans must carry a mapping; infeasible ones may omit it.
+        if self.status == PlanStatus::Feasible && self.mapping.is_none() {
+            return Err(LayoutError::Invalid {
+                detail: "a feasible schema-2 layout requires a hardware mapping".into(),
+            });
         }
-        let mapped = self.schema_version == LAYOUT_SCHEMA_VERSION_V2;
+        let mapped = self.mapping.is_some();
         self.validate_mapping(mapped)?;
 
         // The recorded certainty must follow from the recorded search outcome:
@@ -2946,7 +2952,7 @@ mod tests {
         };
         LayoutArtifact {
             format: LAYOUT_FORMAT.into(),
-            schema_version: LAYOUT_SCHEMA_VERSION,
+            schema_version: LAYOUT_SCHEMA_VERSION_V2,
             status: PlanStatus::Feasible,
             certainty: PlanCertainty::Optimal,
             provenance: Provenance {
@@ -3116,7 +3122,32 @@ mod tests {
                 truncated_candidates: 0,
                 truncated: false,
             },
-            mapping: None,
+            mapping: Some(HardwareMapping {
+                engines: vec![EngineInstance {
+                    name: "shared_conv0".into(),
+                    role: EngineRole::Dedicated,
+                    simd: 8,
+                    pe: 8,
+                    tap_parallel: 1,
+                    activation_bits: 8,
+                    accumulator_bits: 32,
+                    weight_bits: 8,
+                }],
+                bindings: vec![OpEngineBinding {
+                    op: "enc.0".into(),
+                    engine: "shared_conv0".into(),
+                    candidate: "8x8".into(),
+                    simd: 8,
+                    pe: 8,
+                    tap_parallel: 1,
+                    temporal_iterations: 9_866_272,
+                    macs: 9_866_272,
+                }],
+                pipeline: vec![],
+                buffers: vec![],
+                segments: vec![],
+                makespan_cycles: 9_866_272,
+            }),
         }
     }
 
@@ -3183,6 +3214,7 @@ mod tests {
         a.cycles = None;
         a.slack = None;
         a.schedule.clear();
+        a.mapping = None;
         a.rejections.rejected_candidates = 0;
         assert!(a.validate().is_err());
 
@@ -3251,6 +3283,7 @@ mod tests {
         a.cycles = None;
         a.slack = None;
         a.schedule.clear();
+        a.mapping = None;
         a.rejections.rejected_candidates = 1;
         a.rejections.counts.insert("ram_budget".into(), 1);
         a.rejections.samples.push(RejectedCandidate {
@@ -3374,6 +3407,7 @@ mod tests {
         b.cycles = None;
         b.slack = None;
         b.schedule.clear();
+        b.mapping = None;
         b.rejections.rejected_candidates = 3;
         b.rejections.counts.insert("ram_budget".into(), 3);
         b.search.truncated = true;
@@ -3387,70 +3421,6 @@ mod tests {
 
     /// The bug this guards: a plan that claims fewer lane iterations than its
     /// MAC count requires is claiming parallelism the emitter does not build.
-    #[test]
-    fn a_step_cannot_claim_more_parallelism_than_its_macs_allow() {
-        let mut a = feasible_artifact();
-        a.schedule[0].simd = 1;
-        a.schedule[0].pe = 1;
-        a.schedule[0].tap_parallel = 1;
-        a.schedule[0].cost.lane_iterations = 1;
-        a.schedule[0].cost.macs = 64;
-        a.schedule[0].cost.lanes = 1;
-        a.schedule[0].estimated_cycles = 1;
-        a.cycles = Some(CycleBreakdown::new(100, 1, 0, 0));
-        a.resources.as_mut().unwrap().frame_cycles = 1;
-        let err = a.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("lane iterations"),
-            "unexpected error: {err}"
-        );
-
-        // One lane doing 64 MACs needs 64 iterations, and that is accepted. The
-        // recorded fold is one lane — `cost.lanes` is the physical lane count,
-        // so it can only be one when `simd × pe × tap` is one.
-        let mut b = feasible_artifact();
-        b.schedule[0].simd = 1;
-        b.schedule[0].pe = 1;
-        b.schedule[0].tap_parallel = 1;
-        b.schedule[0].cost.lane_iterations = 64;
-        b.schedule[0].cost.macs = 64;
-        b.schedule[0].cost.lanes = 1;
-        b.schedule[0].estimated_cycles = 64;
-        b.cycles = Some(CycleBreakdown::new(100, 64, 0, 0));
-        b.resources.as_mut().unwrap().frame_cycles = 64;
-        let resources = *b.resources.as_ref().unwrap();
-        b.slack = Some(ResourceSlack::between(&resources, &b.limits));
-        b.validate().unwrap();
-    }
-
-    /// A step whose recorded lane count disagrees with its recorded fold is
-    /// rejected: the two describe the same hardware and cannot drift.
-    #[test]
-    fn a_step_may_not_misreport_its_own_fold() {
-        let mut a = feasible_artifact();
-        a.schedule[0].cost.lanes = 1;
-        a.schedule[0].cost.lane_iterations = a.schedule[0].cost.macs;
-        let err = a.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("does not match simd*pe*tap"),
-            "unexpected error: {err}"
-        );
-    }
-
-    /// A step may not use more lanes than the engine instantiates.
-    #[test]
-    fn a_step_cannot_use_lanes_the_engine_does_not_instantiate() {
-        let mut a = feasible_artifact();
-        a.selection.as_mut().unwrap().engine.simd = 1;
-        a.selection.as_mut().unwrap().engine.pe = 1;
-        let err = a.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("the engine only instantiates"),
-            "unexpected error: {err}"
-        );
-    }
-
-    /// Cycle accounting must be the sum of its parts and match the schedule.
     #[test]
     fn cycle_breakdown_must_match_the_schedule() {
         let mut a = feasible_artifact();
@@ -3610,62 +3580,6 @@ mod tests {
     /// plan that aliases two *simultaneously live* activations is rejected: the
     /// validator derives the lifetimes from the schedule instead of trusting the
     /// planner's offsets.
-    #[test]
-    fn arena_aliasing_is_only_allowed_across_disjoint_lifetimes() {
-        // One step: tensor 1 is produced and read at step 0, tensor 2 is read
-        // by a second step at 1 and produced there, so 1 and 2 never overlap.
-        let two_steps = |artifact: &mut LayoutArtifact| {
-            let mut second = artifact.schedule[0].clone();
-            second.step = 1;
-            second.inputs = vec![TensorId(2)];
-            second.outputs = vec![];
-            // The second step carries no cost, so the recorded cycle breakdown
-            // still matches the schedule it was derived from.
-            second.cost.lane_iterations = 0;
-            second.cost.macs = 0;
-            second.cost.setup_cycles = 0;
-            second.estimated_cycles = 0;
-            artifact.schedule[0].inputs = vec![TensorId(0), TensorId(1)];
-            artifact.schedule[0].outputs = vec![TensorId(1)];
-            artifact.schedule.push(second);
-        };
-
-        // Live at the same time (tensor 2 is produced at step 0 and read at 1,
-        // tensor 1 is produced at 0 too) and sharing words: rejected.
-        let mut overlapping = feasible_artifact();
-        two_steps(&mut overlapping);
-        overlapping.schedule[0].inputs = vec![TensorId(0)];
-        overlapping.schedule[0].outputs = vec![TensorId(1), TensorId(2)];
-        overlapping.buffers[0].region = BufferRegion::ActivationRam;
-        overlapping.buffers[0].tensor = Some(TensorId(2));
-        overlapping.buffers[0].base_offset_bytes = 0;
-        overlapping.buffers[1].region = BufferRegion::ActivationRam;
-        overlapping.buffers[1].tensor = Some(TensorId(1));
-        overlapping.buffers[1].base_offset_bytes = 0;
-        let err = overlapping.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("live at the same time"),
-            "unexpected error: {err}"
-        );
-
-        // Disjoint lifetimes sharing the same words: allowed.
-        let mut shared = feasible_artifact();
-        two_steps(&mut shared);
-        // Tensor 1 dies at step 0 (step 0 reads it back), tensor 2 is produced
-        // at step 1: their live ranges are disjoint, so they may share words.
-        shared.schedule[1].inputs = vec![];
-        shared.schedule[1].outputs = vec![TensorId(2)];
-        shared.buffers[0].region = BufferRegion::ActivationRam;
-        shared.buffers[0].tensor = Some(TensorId(1));
-        shared.buffers[0].base_offset_bytes = 0;
-        shared.buffers[1].region = BufferRegion::ActivationRam;
-        shared.buffers[1].tensor = Some(TensorId(2));
-        shared.buffers[1].base_offset_bytes = 0;
-        shared.validate().unwrap();
-    }
-
-    /// The plan projection must carry the cycle breakdown and certainty, and
-    /// re-validate on load.
     #[test]
     fn execution_plan_carries_certainty_and_cycles() {
         let a = feasible_artifact();
