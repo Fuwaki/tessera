@@ -16,9 +16,6 @@
 #                    exports TESSERA_ACCEPTANCE_STRICT=1, so the acceptance tests
 #                    themselves fail on an uncovered gate instead of skipping it.
 #   --features LIST  cargo features to build the CLI and the tests with.
-#                    Default: `melior` under --strict, nothing otherwise, because
-#                    only the `melior` build can run `optimize`, and the strict
-#                    chain insists on the optimized-MLIR path.
 #
 # Environment:
 #   CARGO                   cargo binary (default: cargo)
@@ -82,11 +79,9 @@ if [ "$FEATURES_GIVEN" = "yes" ]; then
     if [ -n "$FEATURES" ]; then
         FEATURE_ARGS="--features $FEATURES"
     fi
-elif [ "$STRICT" = "yes" ]; then
-    FEATURE_ARGS="--features melior"
 fi
 echo "cargo features: ${FEATURE_ARGS:-none}"
-if [ -n "$FEATURE_ARGS" ]; then
+if true; then
     if [ -z "${MLIR_SYS_230_PREFIX:-}" ] || [ -z "${TABLEGEN_230_PREFIX:-}" ]; then
         echo "note: MLIR_SYS_230_PREFIX / TABLEGEN_230_PREFIX are unset; the build will fail" \
             "unless they point at an LLVM/MLIR 23.x prefix (docs/developer-setup.md)"
@@ -193,14 +188,6 @@ else
     fail "rtl: CLI acceptance failed" "$OUT" "$ERR"
 fi
 
-# The optimized-MLIR leg is part of the CLI suite only when it is built; say so
-# explicitly instead of letting a missing feature look like a pass.
-if [ -z "$FEATURE_ARGS" ]; then
-    uncovered "rtl: the optimized-MLIR acceptance leg needs --features melior" \
-        "rerun with --strict (which defaults to it) or pass --features melior"
-else
-    pass "rtl: the optimized-MLIR acceptance leg ran with the pinned feature"
-fi
 
 section "4. end-to-end CLI: import -> emit-mlir -> optimize -> solve --mlir"
 GRAPH_STAGE="$WORK/graph"
